@@ -6,7 +6,7 @@
 
 Dashboard de monitoreo en tiempo real para **Splash** (motor de inferencia LLM en Apple Silicon) + **macmon** (métricas hardware de GPU/CPU/fan).
 
-> Estilo: réplica de [sparkDash](https://github.com/vladkens/sparkDash) adaptado a **un solo equipo** (Mac Mini M5 Pro).
+> Estilo: réplica de [sparkDash](https://github.com/MiaAI-Lab/sparkDash) adaptado a **un solo equipo** (Mac Mini M5 Pro).
 
 ## Qué muestra
 
@@ -24,7 +24,7 @@ Dashboard de monitoreo en tiempo real para **Splash** (motor de inferencia LLM e
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│  Mac Mini M5 Pro (192.168.1.30)                                │
+│  Mac Mini M5 Pro (192.168.1.x)                                │
 │                                                                │
 │  ┌──────────────┐         ┌──────────────┐                     │
 │  │  Splash      │         │  macmon      │                     │
@@ -37,7 +37,7 @@ Dashboard de monitoreo en tiempo real para **Splash** (motor de inferencia LLM e
           │    HTTP GET (5s poll)  │
           ▼                         ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│  VM Linux (192.168.1.233)                                      │
+│  VM Linux (192.168.1.x)                                       │
 │                                                                │
 │  ┌─────────────────────────────────────────────────────────┐    │
 │  │  splash_monitor.py (Flask, :8081)                       │    │
@@ -51,7 +51,7 @@ Dashboard de monitoreo en tiempo real para **Splash** (motor de inferencia LLM e
 │  └─────────────────────────────────────────────────────────┘    │
 └─────────────────────────────────────────────────────────────────┘
           │
-          │  http://192.168.1.233:8081
+          │  http://192.168.1.x:8081
           ▼
      Navegador (cualquier equipo en la LAN)
 ```
@@ -83,7 +83,7 @@ brew install vladkens/macmon/macmon   # macmon
 
 ```bash
 git clone <URL> ~/dashsplash
-# o: rsync -av dashsplash/ user@192.168.1.233:~/dashsplash/
+# o: rsync -av dashsplash/ user@192.168.1.x:~/dashsplash/
 ```
 
 ### 2. Instalar dependencias Python
@@ -112,19 +112,40 @@ curl http://localhost:8081/
 ### 5. Abrir en navegador
 
 ```
-http://192.168.1.233:8081
+http://192.168.1.x:8081
 ```
 
 ## Configuración
 
-Las URLs de las fuentes se definen al inicio de `splash_monitor.py`:
+Todo se configura con **variables de entorno** (o un fichero `.env` que el launcher carga). El repo es 100% genérico: no contiene IPs ni URLs personales.
 
-```python
-SPLASH_URL = "http://192.168.1.30:8000/metrics"
-MACMON_URL = "http://192.168.1.30:9090/json"
-```
+1. **Copia la plantilla** (está gitignored, no se sube):
 
-Ajustar `SPLASH_URL` y `MACMON_URL` a las IPs reales del Mac. También `MEMORY_TOTAL_GB` si la RAM difiere.
+   ```bash
+   cp .env.example .env
+   ```
+
+2. **Edita `.env`** con tus valores:
+
+   ```bash
+   # .env — tu configuración local (gitignored, nunca se sube a GitHub)
+   DASHSPLASH_SPLASH_URL="http://192.168.1.x:8000/metrics"
+   DASHSPLASH_MACMON_URL="http://192.168.1.x:9090/json"
+   DASHSPLASH_MODEL="Qwen3.8-27B-4bit"
+   DASHSPLASH_GPU_TDP="100"          # TDP GPU en vatios
+   DASHSPLASH_MEM_GB="54.5"          # memoria unificada en GB
+   DASHSPLASH_NODE_NAME="Mac Mini M5 Pro"
+   DASHSPLASH_NODE_IP="192.168.1.x"  # solo cosmético (badge)
+   DASHSPLASH_PORT="8081"
+   ```
+
+3. **Reinicia** el servicio para que cargue los cambios:
+
+   ```bash
+   systemctl restart dashsplash
+   ```
+
+Sin `.env`, el dashboard arranca con valores por defecto (`127.0.0.1`) — útil para pruebas.
 
 ## Archivos
 
@@ -192,8 +213,8 @@ No es necesario el wrapper bash `while true` del `/tmp/run_splash_monitor.sh`.
 |---|---|---|
 | 500 Internal Server Error | DASHBOARD es tuple (coma tras `'''`) | Quitar la coma: `'''` no `''',` |
 | Gráficas vacías | Canvas `offsetWidth` = 0 al dibujar | Usar `requestAnimationFrame` o `setTimeout(0)` |
-| "Splash FAIL" | Splash no responde | Verificar `curl http://192.168.1.30:8000/metrics` |
-| "Macmon FAIL" | macmon no responde | Verificar `curl http://192.168.1.30:9090/json` |
+| "Splash FAIL" | Splash no responde | Verificar `curl http://192.168.1.x:8000/metrics` |
+| "Macmon FAIL" | macmon no responde | Verificar `curl http://192.168.1.x:9090/json` |
 | Puerto 8081 ocupado | Proceso zombie | `fuser -k 8081/tcp` |
 | Puerto bloqueado en firewall | iptables | `sudo iptables -I INPUT -p tcp --dport 8081 -j ACCEPT` |
 

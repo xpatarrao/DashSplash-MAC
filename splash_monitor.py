@@ -1,3 +1,4 @@
+import os
 import time
 import requests
 import threading
@@ -6,11 +7,17 @@ import sys
 from flask import Flask, render_template_string, jsonify
 
 app = Flask(__name__)
-SPLASH_URL = "http://192.168.1.30:8000/metrics"
-MACMON_URL = "http://192.168.1.30:9090/json"
-MODEL_NAME = "Qwen3.8-27B-4bit"
-GPU_TDP = 100  # M5 Pro GPU TDP in W (approx)
-MEMORY_TOTAL_GB = 54.5
+
+# ---- Config (override via env vars, or a `.env` file sourced by the launcher) ----
+# Defaults are generic so the repo is safe to publish; put your real values in `.env`.
+SPLASH_URL        = os.getenv("DASHSPLASH_SPLASH_URL", "http://127.0.0.1:8000/metrics")
+MACMON_URL        = os.getenv("DASHSPLASH_MACMON_URL", "http://127.0.0.1:9090/json")
+MODEL_NAME        = os.getenv("DASHSPLASH_MODEL",      "Qwen3.8-27B-4bit")
+GPU_TDP           = float(os.getenv("DASHSPLASH_GPU_TDP",  "100"))    # GPU TDP in W
+MEMORY_TOTAL_GB   = float(os.getenv("DASHSPLASH_MEM_GB",  "54.5"))    # unified memory in GB
+NODE_NAME         = os.getenv("DASHSPLASH_NODE_NAME",  "Mac Mini M5 Pro")
+NODE_IP           = os.getenv("DASHSPLASH_NODE_IP",    "192.168.1.x")
+PORT              = int(os.getenv("DASHSPLASH_PORT",   "8081"))
 
 metrics_cache = {}
 macmon_cache = {}
@@ -450,7 +457,7 @@ function renderNode(splash, macmon) {
             <span class="node-dot" id="node-dot"></span>
             <span class="node-name">Mac Mini M5 Pro</span>
             <span class="node-badge head">HEAD</span>
-            <span class="node-ip">192.168.1.30</span>
+            <span class="node-ip">192.168.1.x</span>
         </div>
 
         <div class="mem-section">
@@ -875,9 +882,21 @@ fetchData();
 </body>
 </html>'''
 
+def _page():
+    """Return the dashboard HTML with the configured node/model/mem values injected.
+    No-op when the env defaults are used, so the public repo stays generic and
+    the service stays correct with a real `.env`."""
+    html = DASHBOARD
+    html = html.replace("Mac Mini M5 Pro", NODE_NAME)
+    html = html.replace("54.5 GB", f"{MEMORY_TOTAL_GB} GB")
+    html = html.replace("54.5e9", f"{MEMORY_TOTAL_GB}e9")
+    html = html.replace("Qwen3.8-27B-4bit", MODEL_NAME)
+    html = html.replace("192.168.1.x", NODE_IP)
+    return html
+
 @app.route('/')
 def dashboard():
-    return DASHBOARD
+    return _page()
 
 @app.route('/api/splash')
 def api_splash():
@@ -888,5 +907,5 @@ def api_macmon():
     return jsonify(macmon_cache.get('macmon', {}))
 
 if __name__ == '__main__':
-    print("Mac Mini M5 Pro Monitor on 0.0.0.0:8081")
-    app.run(host='0.0.0.0', port=8081, threaded=True)
+    print(f"{NODE_NAME} Monitor on 0.0.0.0:{PORT}")
+    app.run(host='0.0.0.0', port=PORT, threaded=True)

@@ -16,3 +16,6 @@ logs/
 
 # Runtime
 nohup.out
+
+# Local config (real URLs/IPs) — never commit
+.env
