@@ -4,6 +4,10 @@
   <img src="preview.jpg" alt="DashSplash MAC dashboard" width="700">
 </p>
 
+<p align="center">
+  <strong>Español</strong> · <a href="README.en.md">English</a>
+</p>
+
 Dashboard de monitoreo en tiempo real para **Splash** (motor de inferencia LLM en Apple Silicon) + **macmon** (métricas hardware de GPU/CPU/fan) + **Ollama** (modelos cargados, optativo).
 
 > Estilo: réplica de [sparkDash](https://github.com/MiaAI-Lab/sparkDash) adaptado a **un solo equipo** (Mac Mini M5 Pro).
@@ -167,7 +171,9 @@ Sin `.env`, el dashboard arranca con valores por defecto (`127.0.0.1`) — útil
 | `dashsplash.sh` | Launcher: resuelve el binario Python y arranca el monitor |
 | `systemd/dashsplash.service` | Servicio systemd (arranca en boot, `Restart=always`) |
 | `install.sh` | Script de instalación (copia servicio, enable, start) |
-| `README.md` | Esta documentación |
+| `README.md` | Esta documentación (español) |
+| `README.en.md` | English documentation |
+| `preview.jpg` | Dashboard screenshot |
 
 ## Métricas disponibles
 
