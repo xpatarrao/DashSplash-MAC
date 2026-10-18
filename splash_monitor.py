@@ -12,6 +12,7 @@ app = Flask(__name__)
 # Defaults are generic so the repo is safe to publish; put your real values in `.env`.
 SPLASH_URL        = os.getenv("DASHSPLASH_SPLASH_URL", "http://127.0.0.1:8000/metrics")
 MACMON_URL        = os.getenv("DASHSPLASH_MACMON_URL", "http://127.0.0.1:9090/json")
+OLLAMA_URL        = os.getenv("DASHSPLASH_OLLAMA_URL", "http://127.0.0.1:11434/api/ps")
 MODEL_NAME        = os.getenv("DASHSPLASH_MODEL",      "Qwen3.8-27B-4bit")
 GPU_TDP           = float(os.getenv("DASHSPLASH_GPU_TDP",  "100"))    # GPU TDP in W
 MEMORY_TOTAL_GB   = float(os.getenv("DASHSPLASH_MEM_GB",  "54.5"))    # unified memory in GB
@@ -21,6 +22,7 @@ PORT              = int(os.getenv("DASHSPLASH_PORT",   "8081"))
 
 metrics_cache = {}
 macmon_cache = {}
+ollama_cache = {}
 history = {
     'memory_used': [], 'memory_limit': [],
     'decode_tps': [], 'prefill_tps': [],
@@ -107,6 +109,10 @@ def extract_macmon(data):
     m['cpu_freq'] = data.get('ecpu_freq_mhz', 0)
     fans = data.get('fans', [])
     m['fan_rpm'] = fans[0].get('rpm', 0) if isinstance(fans, list) and len(fans) > 0 else 0
+    # RAM real del sistema (fuente de verdad, no el techo de splash)
+    mem = data.get('memory', {})
+    m['mem_total'] = mem.get('ram_total', int(MEMORY_TOTAL_GB * 1e9))
+    m['mem_used']  = mem.get('ram_usage', 0)
     return m
 
 def record_history(splash, macmon):
@@ -143,15 +149,44 @@ def fetch_macmon():
     except:
         return {}
 
+def extract_ollama(data):
+    models = data.get('models', [])
+    total_vram = sum(m.get('size_vram', 0) for m in models)
+    total_ram  = sum(m.get('size', 0) for m in models)
+    m = {}
+    m['online']   = bool(models)
+    m['count']    = len(models)
+    m['vram_used'] = total_vram
+    m['ram_used']  = total_ram
+    m['models'] = [
+        {
+            'name':    (m2.get('name') or m2.get('model') or '?'),
+            'vram':    m2.get('size_vram', 0),
+            'ram':     m2.get('size', 0),
+            'details': m2.get('details', {}),
+            'expires': m2.get('expires_at', ''),
+        } for m2 in models
+    ]
+    return m
+
+def fetch_ollama():
+    try:
+        r = requests.get(OLLAMA_URL, timeout=3)
+        return extract_ollama(r.json())
+    except:
+        return {'online': False, 'count': 0, 'vram_used': 0, 'ram_used': 0, 'models': []}
+
 def update_loop():
-    global metrics_cache, macmon_cache
+    global metrics_cache, macmon_cache, ollama_cache
     while True:
         try:
             splash = fetch_data()
             macmon = fetch_macmon()
+            ollama = fetch_ollama()
             record_history(splash, macmon)
             metrics_cache['splash'] = splash
             macmon_cache['macmon'] = macmon
+            ollama_cache['ollama'] = ollama
         except:
             pass
         time.sleep(5)
@@ -236,12 +271,16 @@ body {
 .mem-label { font-size: 11px; color: var(--text-dim); margin-bottom: 4px; }
 .mem-free { font-size: 14px; font-weight: 700; margin-bottom: 6px; }
 .mem-bar { height: 8px; background: #2a2f3a; border-radius: 4px; overflow: hidden; display: flex; }
-.mem-bar-model { background: var(--green); height: 100%; }
+.mem-bar-splash { background: var(--green); height: 100%; }
+.mem-bar-ollama { background: var(--blue); height: 100%; }
 .mem-bar-sys { background: var(--purple); height: 100%; }
-.mem-legend { display: flex; gap: 12px; margin-top: 5px; font-size: 10px; color: var(--text-dim); }
+.mem-bar-free { background: #3a3f4a; height: 100%; }
+.mem-legend { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 5px; font-size: 10px; color: var(--text-dim); }
 .mem-legend span::before { content: '● '; }
-.mem-legend .lg-model::before { color: var(--green); }
+.mem-legend .lg-splash::before { color: var(--green); }
+.mem-legend .lg-ollama::before { color: var(--blue); }
 .mem-legend .lg-sys::before { color: var(--purple); }
+.mem-legend .lg-free::before { color: #5a6070; }
 
 /* GPU metrics row */
 .gpu-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 14px; }
@@ -401,7 +440,7 @@ const REFRESH_MS = 5000;
 const history = {};
 const historyKeys = ['memory_used','memory_limit','decode_tps','prefill_tps','ttft_p50','itl_p50','gpu_temp','cpu_temp','gpu_power','sys_power','gpu_util','gpu_freq','fan_rpm'];
 historyKeys.forEach(k => history[k] = []);
-let lastSplash = {}, lastMacmon = {};
+let lastSplash = {}, lastMacmon = {}, lastOllama = {};
 let activityLog = [];
 let startTime = Date.now();
 let lastEnergy = 0;
@@ -422,8 +461,9 @@ function pushHistory(key, val, now) {
     while (history[key].length > 720) history[key].shift();
 }
 
-function renderNode(splash, macmon) {
+function renderNode(splash, macmon, ollama) {
     const card = document.getElementById('node-card');
+    ollama = ollama || {};
     const thermal = splash.thermal_state || 'nominal';
     const gt = macmon.gpu_temp || 0;
     const gp = macmon.gpu_power || 0;
@@ -435,13 +475,18 @@ function renderNode(splash, macmon) {
     const dtps = splash.decode_tps || 0;
     const ptps = splash.prefill_tps || 0;
     const mu = splash.mem_current || 0;
-    const ml = splash.mem_limit || 54.5e9;
-    const muGB = gb(mu), mlGB = gb(ml);
-    const freeGB = mlGB - muGB;
-    const modelGB = muGB;
-    const sysGB = Math.max(0, mlGB - modelGB);
-    const modelPct = mlGB > 0 ? (modelGB / mlGB * 100) : 0;
-    const sysPct = mlGB > 0 ? (sysGB / mlGB * 100) : 0;
+    const rmTot = macmon.mem_total || 54.5e9;
+    const rmUsed = macmon.mem_used || 0;
+    const ollGB = gb(ollama.ram_used || 0);
+    const totGB = gb(rmTot);
+    const freeGB = Math.max(0, totGB - gb(rmUsed));
+    const splashGB = gb(mu);
+    // segmentos de la barra (acotados a 100%)
+    let sPct = totGB > 0 ? Math.min(100, splashGB / totGB * 100) : 0;
+    let oPct = totGB > 0 ? Math.min(Math.max(0, 100 - sPct), ollGB / totGB * 100) : 0;
+    let sysGB = Math.max(0, gb(rmUsed) - splashGB - ollGB);
+    let sysPct = totGB > 0 ? Math.min(Math.max(0, 100 - sPct - oPct), sysGB / totGB * 100) : 0;
+    let freePct = Math.max(0, 100 - sPct - oPct - sysPct);
     const sd = splash.scheduler_decoding || 0;
     const sp2 = splash.scheduler_prefilling || 0;
     const sq = splash.scheduler_queued || 0;
@@ -464,12 +509,16 @@ function renderNode(splash, macmon) {
             <div class="mem-label">Unified memory</div>
             <div class="mem-free">${freeGB.toFixed(1)} GB free</div>
             <div class="mem-bar">
-                <div class="mem-bar-model" style="width:${modelPct}%"></div>
+                <div class="mem-bar-splash" style="width:${sPct}%"></div>
+                <div class="mem-bar-ollama" style="width:${oPct}%"></div>
                 <div class="mem-bar-sys" style="width:${sysPct}%"></div>
+                <div class="mem-bar-free" style="width:${freePct}%"></div>
             </div>
             <div class="mem-legend">
-                <span class="lg-model">Model ${modelGB.toFixed(1)} GB</span>
+                <span class="lg-splash">Splash ${splashGB.toFixed(1)} GB</span>
+                <span class="lg-ollama">Ollama ${ollGB.toFixed(1)} GB</span>
                 <span class="lg-sys">System ${sysGB.toFixed(1)} GB</span>
+                <span class="lg-free">Free ${freeGB.toFixed(1)} GB</span>
             </div>
         </div>
 
@@ -515,6 +564,17 @@ function renderNode(splash, macmon) {
             <span class="model-ctx">4bit · ${splash.runtime || 'native'}</span>
             <span style="margin-left:auto;font-size:11px;color:var(--text-dim)">TTFT ${splash.ttft_p50?.toFixed(0) || '—'}ms · ITL ${splash.itl_p50?.toFixed(0) || '—'}ms</span>
         </div>
+
+        ${ollama && ollama.count > 0 ? `
+        <div class="divider"></div>
+        <div class="model-box" style="background:var(--blue-bg);border-color:var(--blue)">
+            <span style="font-size:11px;color:var(--blue);font-weight:700;text-transform:uppercase">Ollama</span>
+            ${ollama.models.map(mo => `
+            <span class="model-name" style="color:var(--blue)">${mo.name}</span>
+            <span class="model-ctx">${(mo.ram/1e9).toFixed(1)} GB RAM${mo.vram ? ' · ' + (mo.vram/1e9).toFixed(1) + ' GB GPU' : ''}</span>
+            `).join('')}
+            <span style="margin-left:auto;font-size:11px;color:var(--text-dim)">${ollama.count} model${ollama.count>1?'s':''} loaded</span>
+        </div>` : ''}
     </div>`;
 }
 
@@ -522,8 +582,8 @@ function renderStats(splash, macmon) {
     const row = document.getElementById('stats-row');
     const dtps = splash.decode_tps || 0;
     const sp = macmon.sys_power || 0;
-    const mu = splash.mem_current || 0;
-    const ml = splash.mem_limit || 54.5e9;
+    const mu = macmon.mem_used || splash.mem_current || 0;
+    const ml = macmon.mem_total || 54.5e9;
     const memPct = ml > 0 ? (mu / ml * 100) : 0;
     const genTokens = splash.decode_tokens || 0;
     const prefillTokens = splash.prefill_tokens || 0;
@@ -821,13 +881,16 @@ function updateActivity(splash, macmon) {
     }
 }
 
-function updateStatus(splash, macmon) {
+function updateStatus(splash, macmon, ollama) {
     const splashOk = splash.decode_tps !== undefined || splash.mem_current !== undefined;
     const macmonOk = macmon.gpu_temp !== undefined;
+    const ollamaOk = !!(ollama && ollama.models !== undefined);
     const el = document.getElementById('header-status');
     const now = new Date().toLocaleTimeString();
     const thermal = splash.thermal_state || 'nominal';
+    const ollamaState = ollama && ollama.count > 0 ? `${ollama.count} loaded` : 'idle';
     el.innerHTML = `Splash: <span style="color:${splashOk?'var(--green)':'var(--red)'}">${splashOk?'OK':'FAIL'}</span>
+        &nbsp; Ollama: <span style="color:${ollamaOk?'var(--green)':'var(--red)'}">${ollamaOk?ollamaState:'FAIL'}</span>
         &nbsp; Macmon: <span style="color:${macmonOk?'var(--green)':'var(--red)'}">${macmonOk?'OK':'FAIL'}</span>
         &nbsp; Thermal: <span style="color:${thermal==='critical'?'var(--red)':thermal==='serious'?'var(--orange)':thermal==='fair'?'var(--orange)':'var(--green)'}">${thermal}</span>
         &nbsp; Runtime: ${splash.runtime || 'native'}
@@ -838,10 +901,12 @@ function fetchData() {
     Promise.all([
         fetch('/api/splash').then(r => r.json()).catch(() => ({})),
         fetch('/api/macmon').then(r => r.json()).catch(() => ({})),
-    ]).then(([splash, macmon]) => {
+        fetch('/api/ollama').then(r => r.json()).catch(() => ({})),
+    ]).then(([splash, macmon, ollama]) => {
         const now = Date.now();
         lastSplash = splash;
         lastMacmon = macmon;
+        lastOllama = ollama;
 
         if (splash.decode_tps !== undefined) {
             pushHistory('memory_used', splash.mem_current / 1e9, now);
@@ -862,11 +927,11 @@ function fetchData() {
         }
 
         updateActivity(splash, macmon);
-        renderNode(splash, macmon);
+        renderNode(splash, macmon, ollama);
         renderStats(splash, macmon);
         renderBottom(splash, macmon);
         renderCharts();
-        updateStatus(splash, macmon);
+        updateStatus(splash, macmon, ollama);
 
         setTimeout(fetchData, REFRESH_MS);
     }).catch(() => {
@@ -905,6 +970,10 @@ def api_splash():
 @app.route('/api/macmon')
 def api_macmon():
     return jsonify(macmon_cache.get('macmon', {}))
+
+@app.route('/api/ollama')
+def api_ollama():
+    return jsonify(ollama_cache.get('ollama', {}))
 
 if __name__ == '__main__':
     print(f"{NODE_NAME} Monitor on 0.0.0.0:{PORT}")

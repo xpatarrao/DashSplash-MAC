@@ -13,7 +13,7 @@ Dashboard de monitoreo en tiempo real para **Splash** (motor de inferencia LLM e
 | Sección | Fuente | Métricas |
 |---|---|---|
 | **Header** | Splash + macmon | Estado OK/FAIL, thermal (nominal/fair/serious/critical), runtime, hora |
-| **Card nodo** | Splash + macmon | Memoria unificada (free/model/system), GPU util %, temp, power, freq, decode/prefill tok/s, scheduler, modelo, TTFT/ITL |
+| **Card nodo** | Splash + macmon + Ollama | Memoria unificada con **desglose por motor** (barra: splash/ollama/system/free + GB de cada uno), GPU util %, temp, power, freq, decode/prefill tok/s, scheduler, modelo splash, modelos ollama, TTFT/ITL |
 | **Stats agregados** | Splash + macmon | Decode tok/s (sparkline), power W (sparkline), memoria %, tokens totales |
 | **Energy** | macmon | kWh sesión, current W, eficiencia kWh/token, gráfica de barras 24h |
 | **Token totals** | Splash | Generated / Cached / Prefill, tabla por modelo |
@@ -163,9 +163,9 @@ Sin `.env`, el dashboard arranca con valores por defecto (`127.0.0.1`) — útil
 
 | Métrica | Descripción |
 |---|---|
-| `splash_memory_current_bytes` | RAM unificada en uso |
-| `splash_memory_limit_bytes` | RAM total |
-| `splash_memory_headroom_bytes` | RAM libre |
+| `splash_memory_current_bytes` | RAM unificada en uso (solo lo que splash ve; **no** incluye ollama) |
+| `splash_memory_limit_bytes` | Techo de memoria que splash se permite usar (≈ `MEMORY_TOTAL_GB`), **NO** es la RAM total del sistema |
+| `splash_memory_headroom_bytes` | Headroom dentro del límite de splash |
 | `splash_memory_peak_bytes` | Peak |
 | `splash_thermal_state.{nominal,fair,serious,critical}` | Estado térmico |
 | `splash_decode_tokens_per_second` | Throughput decode |
@@ -197,6 +197,22 @@ Sin `.env`, el dashboard arranca con valores por defecto (`127.0.0.1`) — útil
 | `gpu_freq_mhz` | Frecuencia GPU MHz |
 | `cpu_usage_pct` | Utilización CPU % |
 | `fans[0].rpm` | RPM ventilador |
+| `memory.ram_total` | **RAM total del sistema** (bytes) — la fuente de verdad para la memoria libre |
+| `memory.ram_usage` | RAM usada del sistema (bytes) — incluye splash + ollama + OS |
+| `memory.swap_total` / `memory.swap_usage` | Swap total/usado (bytes) |
+
+### Ollama (JSON `/api/ps`)
+
+> **Optativo**: si el endpoint no responde, la UI oculta su bloque y no rompe nada.
+
+| Campo | Descripción |
+|---|---|
+| `models[].name` | Nombre del modelo cargado (p.ej. `qwen3.5:4b-mlx`) |
+| `models[].size` | Memoria en uso (bytes) — en Mac unificado es la RAM real del modelo |
+| `models[].size_vram` | Misma memoria vista como GPU (pool unificado) — **NO sumar con `size`** (duplica) |
+| `models[].expires_at` | Cuándo se descarga de RAM (inactividad) |
+
+**Nota de memoria (Apple Silicon)**: en un Mac con memoria unificada, Ollama reporta el modelo en `size` **y** `size_vram` con el mismo valor (es un solo pool). El dashboard cuenta solo `size` para el segmento Ollama. La barra de memoria total = splash + ollama + system (resto) + free.
 
 ## Auto-reinicio y persistencia
 
