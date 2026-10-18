@@ -4,20 +4,22 @@
   <img src="preview.jpg" alt="DashSplash MAC dashboard" width="700">
 </p>
 
-Dashboard de monitoreo en tiempo real para **Splash** (motor de inferencia LLM en Apple Silicon) + **macmon** (métricas hardware de GPU/CPU/fan).
+Dashboard de monitoreo en tiempo real para **Splash** (motor de inferencia LLM en Apple Silicon) + **macmon** (métricas hardware de GPU/CPU/fan) + **Ollama** (modelos cargados, optativo).
 
 > Estilo: réplica de [sparkDash](https://github.com/MiaAI-Lab/sparkDash) adaptado a **un solo equipo** (Mac Mini M5 Pro).
+>
+> **Ollama es optativo**: si su endpoint no responde, el dashboard lo omite y sigue funcionando con Splash + macmon.
 
 ## Qué muestra
 
 | Sección | Fuente | Métricas |
 |---|---|---|
-| **Header** | Splash + macmon | Estado OK/FAIL, thermal (nominal/fair/serious/critical), runtime, hora |
+| **Header** | Splash + macmon + Ollama | Estado OK/FAIL, `Ollama: N loaded`, thermal (nominal/fair/serious/critical), runtime, hora |
 | **Card nodo** | Splash + macmon + Ollama | Memoria unificada con **desglose por motor** (barra: splash/ollama/system/free + GB de cada uno), GPU util %, temp, power, freq, decode/prefill tok/s, scheduler, modelo splash, modelos ollama, TTFT/ITL |
-| **Stats agregados** | Splash + macmon | Decode tok/s (sparkline), power W (sparkline), memoria %, tokens totales |
+| **Stats agregados** | Splash + macmon | Decode tok/s (sparkline), power W (sparkline), memoria en uso % (RAM real de macmon: splash + ollama + OS), tokens totales |
 | **Energy** | macmon | kWh sesión, current W, eficiencia kWh/token, gráfica de barras 24h |
 | **Token totals** | Splash | Generated / Cached / Prefill, tabla por modelo |
-| **Activity** | Splash + macmon | Log en vivo (decode started/finished, thermal cambios, GPU hot) |
+| **Activity** | Splash + macmon + Ollama | Log en vivo (decode started/finished, thermal, GPU hot, modelos Ollama cargados/descargados) |
 | **Gráficas** | Splash + macmon | GPU temp, power, throughput (líneas 5 min) |
 
 ## Arquitectura
@@ -72,7 +74,14 @@ Dashboard de monitoreo en tiempo real para **Splash** (motor de inferencia LLM e
 ```bash
 # En el Mac, si no los tienes:
 brew install vladkens/macmon/macmon   # macmon
+brew install ollama                   # Ollama (optativo)
+brew services start ollama            # o: ollama serve
 # Splash: instalar según su README
+```
+
+**Ollama por red** (solo si la VM lo consulta): debe escuchar en todas las interfaces.
+```bash
+OLLAMA_HOST=0.0.0.0 ollama serve     # en vez de 'ollama serve' (que escucha 127.0.0.1)
 ```
 
 ## Instalación en la VM
@@ -133,9 +142,10 @@ Todo se configura con **variables de entorno** (o un fichero `.env` que el launc
    # .env — tu configuración local (gitignored, nunca se sube a GitHub)
    DASHSPLASH_SPLASH_URL="http://192.168.1.x:8000/metrics"
    DASHSPLASH_MACMON_URL="http://192.168.1.x:9090/json"
+   DASHSPLASH_OLLAMA_URL="http://192.168.1.x:11434/api/ps"   # optativo (modelos cargados)
    DASHSPLASH_MODEL="Qwen3.8-27B-4bit"
    DASHSPLASH_GPU_TDP="100"          # TDP GPU en vatios
-   DASHSPLASH_MEM_GB="54.5"          # memoria unificada en GB
+   DASHSPLASH_MEM_GB="64"            # memoria unificada total en GB (solo cosmética: el título)
    DASHSPLASH_NODE_NAME="Mac Mini M5 Pro"
    DASHSPLASH_NODE_IP="192.168.1.x"  # solo cosmético (badge)
    DASHSPLASH_PORT="8081"
@@ -233,6 +243,8 @@ No es necesario el wrapper bash `while true` del `/tmp/run_splash_monitor.sh`.
 | Gráficas vacías | Canvas `offsetWidth` = 0 al dibujar | Usar `requestAnimationFrame` o `setTimeout(0)` |
 | "Splash FAIL" | Splash no responde | Verificar `curl http://192.168.1.x:8000/metrics` |
 | "Macmon FAIL" | macmon no responde | Verificar `curl http://192.168.1.x:9090/json` |
+| Ollama no aparece en el dashboard | Endpoint no responde / escucha en 127.0.0.1 | Arrancar Ollama con `OLLAMA_HOST=0.0.0.0` y revisar `DASHSPLASH_OLLAMA_URL` |
+| Memoria doble en Ollama | Sumar `size` + `size_vram` (pool unificado) | Contar solo `size` (ver sección Ollama) |
 | Puerto 8081 ocupado | Proceso zombie | `fuser -k 8081/tcp` |
 | Puerto bloqueado en firewall | iptables | `sudo iptables -I INPUT -p tcp --dport 8081 -j ACCEPT` |
 
