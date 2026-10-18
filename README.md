@@ -23,33 +23,34 @@ Dashboard de monitoreo en tiempo real para **Splash** (motor de inferencia LLM e
 ## Arquitectura
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│  Mac Mini M5 Pro (192.168.1.x)                                │
-│                                                                │
-│  ┌──────────────┐         ┌──────────────┐                     │
-│  │  Splash      │         │  macmon      │                     │
-│  │  :8000       │         │  :9090       │                     │
-│  │  /metrics    │         │  /json       │                     │
-│  │  (Prometheus)│         │  (JSON)      │                     │
-│  └──────┬───────┘         └──────┬───────┘                     │
-└─────────┼─────────────────────────┼────────────────────────────┘
-          │                         │
-          │    HTTP GET (5s poll)  │
-          ▼                         ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  VM Linux (192.168.1.x)                                       │
-│                                                                │
-│  ┌─────────────────────────────────────────────────────────┐    │
-│  │  splash_monitor.py (Flask, :8081)                       │    │
-│  │                                                        │    │
-│  │  /            → dashboard HTML (template string)        │    │
-│  │  /api/splash  → métricas Splash (JSON)                 │    │
-│  │  /api/macmon  → métricas macmon (JSON)                 │    │
-│  │                                                        │    │
-│  │  update_loop() → poll cada 5s, guarda en dict          │    │
-│  │  JS fetch     → /api/* cada 5s, dibuja canvas          │    │
-│  └─────────────────────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────────────────┐
+│  Mac Mini M5 Pro (192.168.1.x)                                         │
+│                                                                         │
+│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐               │
+│  │  Splash      │    │  macmon      │    │  Ollama      │               │
+│  │  :8000       │    │  :9090       │    │  :11434      │               │
+│  │  /metrics    │    │  /json       │    │  /api/ps     │               │
+│  │  (Prometheus)│    │  (JSON)      │    │  (JSON)      │               │
+│  └──────┬───────┘    └──────┬───────┘    └──────┬───────┘               │
+└─────────┼───────────────────┼───────────────────┼───────────────────────┘
+          │                   │                   │
+          │      HTTP GET (5s poll, 3 fuentes)   │
+          ▼                   ▼                   ▼
+┌───────────────────────────────────────────────────────────────────────────┐
+│  VM Linux (192.168.1.x)                                                 │
+│                                                                         │
+│  ┌──────────────────────────────────────────────────────────────┐        │
+│  │  splash_monitor.py (Flask, :8081)                           │        │
+│  │                                                            │        │
+│  │  /            → dashboard HTML (template string)            │        │
+│  │  /api/splash  → métricas Splash (JSON)                     │        │
+│  │  /api/macmon  → métricas macmon (RAM real, GPU, fans)      │        │
+│  │  /api/ollama  → modelos Ollama cargados (JSON)             │        │
+│  │                                                            │        │
+│  │  update_loop() → poll cada 5s, guarda en dict              │        │
+│  │  JS fetch     → /api/* cada 5s, dibuja canvas              │        │
+│  └──────────────────────────────────────────────────────────────┘        │
+└───────────────────────────────────────────────────────────────────────────┘
           │
           │  http://192.168.1.x:8081
           ▼
@@ -58,14 +59,15 @@ Dashboard de monitoreo en tiempo real para **Splash** (motor de inferencia LLM e
 
 ### Flujo de datos
 
-1. **Backend** (Python/Flask): `update_loop()` hace `requests.get` a Splash `/metrics` (Prometheus) y macmon `/json` cada 5s, parsea y guarda en dicts en memoria.
-2. **Frontend** (JS vanilla): `fetchData()` llama a `/api/splash` y `/api/macmon` cada 5s, acumula en `history[]` (última hora, cap 720 puntos), y redibuja todo el DOM + canvas.
+1. **Backend** (Python/Flask): `update_loop()` hace `requests.get` a las **3 fuentes** cada 5s: Splash `/metrics` (Prometheus), macmon `/json` (RAM real del sistema, GPU, fans) y Ollama `/api/ps` (modelos cargados), parsea y guarda en dicts en memoria. Ollama es **optativo**: si su endpoint no responde, la UI lo omite sin romper nada.
+2. **Frontend** (JS vanilla): `fetchData()` llama a `/api/splash`, `/api/macmon` y `/api/ollama` cada 5s, acumula en `history[]` (última hora, cap 720 puntos), y redibuja todo el DOM + canvas. La memoria unificada se muestra con **desglose por motor** (splash/ollama/system/free).
 3. Las gráficas usan **canvas 2D** (sin librerías externas): sparklines, barras de energía, líneas de temp/power/throughput.
 
 ## Requiere en el Mac
 
 - **Splash** corriendo → expone `:8000/metrics`
 - **macmon** corriendo → expone `:9090/json`
+- **Ollama** corriendo (optativo) → expone `:11434` con `OLLAMA_HOST=0.0.0.0` (para que la VM lo vea por red)
 
 ```bash
 # En el Mac, si no los tienes:
