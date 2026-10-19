@@ -20,6 +20,7 @@ MEMORY_TOTAL_GB   = float(os.getenv("DASHSPLASH_MEM_GB",  "54.5"))    # unified 
 NODE_NAME         = os.getenv("DASHSPLASH_NODE_NAME",  "Mac Mini M5 Pro")
 NODE_IP           = os.getenv("DASHSPLASH_NODE_IP",    "192.168.1.x")
 PORT              = int(os.getenv("DASHSPLASH_PORT",   "8081"))
+KWH_PRICE         = float(os.getenv("DASHSPLASH_KWH_PRICE", "0.13"))  # € per kWh
 
 # Base URLs (host:port only) so we can hit control endpoints that live
 # beside the metrics/ps paths. Used by the "release model" buttons.
@@ -376,7 +377,7 @@ body {
 .bc-sub { font-size: 10px; color: var(--text-mut); margin: 4px 0 10px; }
 .bc-chart { height: 80px; margin-bottom: 10px; }
 .bc-chart canvas { width: 100%; height: 80px; }
-.bc-footer { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+.bc-footer { display: grid; grid-template-columns: repeat(auto-fit, minmax(70px, 1fr)); gap: 8px; }
 .bc-footer .ff-item .ff-label { font-size: 9px; color: var(--text-mut); text-transform: uppercase; }
 .bc-footer .ff-item .ff-val { font-size: 12px; font-weight: 600; }
 
@@ -415,7 +416,21 @@ body {
     background: var(--card); border: 1px solid var(--border);
     border-radius: 10px; padding: 12px 14px;
 }
-.chart-title { font-size: 11px; color: var(--text-dim); margin-bottom: 8px; display: flex; justify-content: space-between; }
+.chart-title { font-size: 11px; color: var(--text-dim); margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 4px; }
+.chart-legend { font-size: 10px; display: inline-flex; gap: 8px; align-items: center; }
+.chart-legend .lg { font-weight: 700; }
+
+/* Modal for Details buttons */
+.modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center; z-index: 1000; }
+.modal { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 20px 24px; max-width: 560px; width: 90%; max-height: 80vh; overflow-y: auto; }
+.modal h3 { margin: 0 0 4px; font-size: 15px; }
+.modal .modal-sub { font-size: 11px; color: var(--text-mut); margin-bottom: 14px; }
+.modal table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.modal th, .modal td { text-align: right; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+.modal th { color: var(--text-dim); font-weight: 600; text-transform: uppercase; font-size: 10px; }
+.modal th:first-child, .modal td:first-child { text-align: left; }
+.modal .modal-close { margin-top: 16px; width: 100%; background: rgba(255,255,255,0.08); border: none; color: var(--text); padding: 8px; border-radius: 6px; cursor: pointer; font-size: 12px; }
+.modal .modal-close:hover { background: rgba(255,255,255,0.15); }
 .chart-canvas { width: 100%; height: 100px; }
 
 @media (max-width: 900px) {
@@ -462,6 +477,7 @@ let lastSplash = {}, lastMacmon = {}, lastOllama = {};
 let activityLog = [];
 let startTime = Date.now();
 let lastEnergy = 0;
+const KWH_PRICE = parseFloat("__KWH_PRICE__") || 0.13;  // € per kWh (injected from .env)
 
 function gb(b) { return b / 1e9; }
 function fmtToks(n) {
@@ -670,7 +686,19 @@ function drawSpark(canvasId, dataKey, color) {
     ctx.fill();
 }
 
-function renderBottom(splash, macmon) {
+function energyKWh() {
+    const pts = history['sys_power'];
+    if (!pts || pts.length < 2) return 0;
+    let kwh = 0;
+    for (let i = 1; i < pts.length; i++) {
+        const dtH = (pts[i][0] - pts[i-1][0]) / 3600000;
+        const p = (pts[i][1] + pts[i-1][1]) / 2;  // trapezoid avg W
+        kwh += (p * dtH) / 1000;
+    }
+    return kwh;
+}
+
+function renderBottom(splash, macmon, ollama) {
     const row = document.getElementById('bottom-row');
     const sp = macmon.sys_power || 0;
     const gp = macmon.gpu_power || 0;
@@ -680,10 +708,11 @@ function renderBottom(splash, macmon) {
     const cachedTokens = splash.cache_reused_tokens || 0;
     const totalTokens = genTokens + cachedTokens + prefillTokens;
 
-    // Energy estimate (kWh since dashboard started)
+    // Energy estimate (kWh since dashboard started, trapezoid of sys_power)
+    const eKWh = energyKWh();
+    const cost = eKWh * KWH_PRICE;
     const elapsedH = (Date.now() - startTime) / 3600000;
-    const energyKWh = elapsedH > 0 ? (sp * elapsedH / 1000) : 0;
-    const efficiency = genTokens > 0 ? (energyKWh / genTokens * 1e6).toFixed(4) : '—';
+    const efficiency = genTokens > 0 ? (eKWh / genTokens * 1e6).toFixed(4) : '—';
 
     let activityHTML;
     const actItems = activityLog.slice(-8).reverse();
@@ -702,14 +731,15 @@ function renderBottom(splash, macmon) {
         <div class="bc-header">
             <span class="bc-title">Energy</span>
             <span class="bc-badge">1/1 fresh</span>
-            <button class="bc-btn">Details</button>
+            <button class="bc-btn" onclick="openEnergyDetails()">Details</button>
         </div>
-        <div class="bc-big">${energyKWh.toFixed(2)} <span class="unit">kWh / session</span></div>
-        <div class="bc-sub">Estimated from power sampling · ${elapsedH > 0.01 ? (elapsedH*60).toFixed(0) + ' min' : 'just started'}</div>
+        <div class="bc-big">${eKWh.toFixed(2)} <span class="unit">kWh / session</span></div>
+        <div class="bc-sub">${cost.toFixed(2)} € · ${KWH_PRICE.toFixed(2)} €/kWh · ${elapsedH > 0.01 ? (elapsedH*60).toFixed(0) + ' min' : 'just started'}</div>
         <div class="bc-chart"><canvas id="energy-chart"></canvas></div>
         <div class="bc-footer">
             <div class="ff-item"><div class="ff-label">Current</div><div class="ff-val">${sp.toFixed(0)} W</div></div>
-            <div class="ff-item"><div class="ff-label">Session</div><div class="ff-val">${energyKWh.toFixed(2)} kWh</div></div>
+            <div class="ff-item"><div class="ff-label">Session</div><div class="ff-val">${eKWh.toFixed(2)} kWh</div></div>
+            <div class="ff-item"><div class="ff-label">Cost</div><div class="ff-val">${cost.toFixed(3)} €</div></div>
             <div class="ff-item"><div class="ff-label">Efficiency</div><div class="ff-val">${efficiency} kWh/k</div></div>
         </div>
     </div>
@@ -717,12 +747,12 @@ function renderBottom(splash, macmon) {
     <div class="bottom-card">
         <div class="bc-header">
             <span class="bc-title">Token totals</span>
-            <span class="bc-badge">1 endpoint</span>
+            <span class="bc-badge">splash</span>
             <span class="bc-badge" style="margin-left:4px">All time</span>
-            <button class="bc-btn">Details</button>
+            <button class="bc-btn" onclick="openTokenDetails()">Details</button>
         </div>
         <div class="bc-big">${fmtToks(genTokens)} <span class="unit">generated</span></div>
-        <div class="bc-sub">Counted by splash monitor since tracking began</div>
+        <div class="bc-sub">Splash engine · Ollama has no token counters in its API</div>
         <div class="token-bar">
             <div class="tb-gen" style="width:${totalTokens > 0 ? genTokens/totalTokens*100 : 33}%"></div>
             <div class="tb-cache" style="width:${totalTokens > 0 ? cachedTokens/totalTokens*100 : 33}%"></div>
@@ -736,8 +766,12 @@ function renderBottom(splash, macmon) {
         <table class="token-table">
             <tr><th>MODEL</th><th>CACHED</th><th>PREFILL</th><th>GEN</th></tr>
             <tr><td>Qwen3.8-27B-4bit</td><td>${fmtToks(cachedTokens)}</td><td>${fmtToks(prefillTokens)}</td><td>${fmtToks(genTokens)}</td></tr>
-            <tr class="total"><td>TOTAL</td><td>${fmtToks(cachedTokens)}</td><td>${fmtToks(prefillTokens)}</td><td>${fmtToks(genTokens)}</td></tr>
+            ${(ollama && ollama.count > 0) ? ollama.models.map(mo =>
+                `<tr style="color:var(--blue)"><td>${mo.name}</td><td>n/a</td><td>n/a</td><td>n/a</td></tr>`
+            ).join('') : ''}
+            <tr class="total"><td>TOTAL (splash)</td><td>${fmtToks(cachedTokens)}</td><td>${fmtToks(prefillTokens)}</td><td>${fmtToks(genTokens)}</td></tr>
         </table>
+        ${(ollama && ollama.count > 0) ? `<div class="bc-sub" style="margin-top:8px">Ollama: ${ollama.count} model${ollama.count>1?'s':''} loaded · ${(ollama.ram_used/1e9).toFixed(1)} GB · tokens n/a (no API counter)</div>` : ''}
     </div>
 
     <div class="bottom-card">
@@ -746,7 +780,7 @@ function renderBottom(splash, macmon) {
             <span class="live-badge">LIVE</span>
         </div>
         <ul class="activity-list" id="activity-list">${activityHTML}</ul>
-        <button class="bc-btn" style="margin-top:8px;margin-left:0">View all activity</button>
+        <button class="bc-btn" style="margin-top:8px;margin-left:0" onclick="openActivityDetails()">View all activity</button>
     </div>`;
 
     // Draw energy chart (synchronously)
@@ -802,15 +836,21 @@ function renderCharts() {
     const row = document.getElementById('charts-row');
     row.innerHTML = `
         <div class="chart-card">
-            <div class="chart-title"><span>GPU temperature</span><span id="ct-gpu">—</span></div>
+            <div class="chart-title"><span>GPU temperature</span>
+                <span class="chart-legend"><span class="lg" style="color:#ea4335">GPU</span><span class="lg" style="color:#f9ab00">CPU</span> <span id="ct-gpu">—</span></span>
+            </div>
             <canvas id="chart-temp" class="chart-canvas"></canvas>
         </div>
         <div class="chart-card">
-            <div class="chart-title"><span>Power</span><span id="ct-power">—</span></div>
+            <div class="chart-title"><span>Power</span>
+                <span class="chart-legend"><span class="lg" style="color:#a144fb">GPU</span><span class="lg" style="color:#4285f4">System</span> <span id="ct-power">—</span></span>
+            </div>
             <canvas id="chart-power" class="chart-canvas"></canvas>
         </div>
         <div class="chart-card">
-            <div class="chart-title"><span>Throughput</span><span id="ct-tp">—</span></div>
+            <div class="chart-title"><span>Throughput</span>
+                <span class="chart-legend"><span class="lg" style="color:#34a853">Decode</span><span class="lg" style="color:#a144fb">Prefill</span> <span id="ct-tp">—</span></span>
+            </div>
             <canvas id="chart-tp" class="chart-canvas"></canvas>
         </div>`;
     requestAnimationFrame(() => {
@@ -969,7 +1009,7 @@ function fetchData() {
         updateActivity(splash, macmon);
         renderNode(splash, macmon, ollama);
         renderStats(splash, macmon);
-        renderBottom(splash, macmon);
+        renderBottom(splash, macmon, ollama);
         renderCharts();
         updateStatus(splash, macmon, ollama);
 
@@ -982,6 +1022,77 @@ function fetchData() {
 // Initial load
 logActivity('Monitoring started', 'green');
 logActivity('Mac Mini M5 Pro online', 'green');
+
+// ─── Modal helpers ─────────────────────────────────────────────────────────
+function openModal(title, sub, html) {
+    closeModal();
+    const ov = document.createElement('div');
+    ov.className = 'modal-overlay';
+    ov.id = 'modal-overlay';
+    ov.onclick = e => { if (e.target === ov) closeModal(); };
+    ov.innerHTML = `
+        <div class="modal">
+            <h3>${title}</h3>
+            ${sub ? `<div class="modal-sub">${sub}</div>` : ''}
+            ${html}
+            <button class="modal-close" onclick="closeModal()">Close</button>
+        </div>`;
+    document.body.appendChild(ov);
+}
+function closeModal() {
+    const m = document.getElementById('modal-overlay');
+    if (m) m.remove();
+}
+
+function openEnergyDetails() {
+    const sp = lastMacmon.sys_power || 0;
+    const gp = lastMacmon.gpu_power || 0;
+    const kwh = energyKWh();
+    const cost = kwh * KWH_PRICE;
+    const genTokens = lastSplash.decode_tokens || 0;
+    const eff = genTokens > 0 ? (kwh / genTokens * 1e6).toFixed(4) : '—';
+    const elapsedH = (Date.now() - startTime) / 3600000;
+    const min = elapsedH > 0 ? (elapsedH * 60).toFixed(0) + ' min' : 'just started';
+    const rows = [
+        ['Current power', `${sp.toFixed(1)} W`],
+        ['GPU power', `${gp.toFixed(1)} W`],
+        ['Session energy', `${kwh.toFixed(3)} kWh`],
+        ['Cost', `${cost.toFixed(3)} € @ ${KWH_PRICE.toFixed(2)} €/kWh`],
+        ['Efficiency', `${eff} kWh per 1k tokens`],
+        ['Session duration', min],
+    ];
+    openModal('Energy details', 'macmon system power · trapezoid integration',
+        `<table><tr><th>Metric</th><th>Value</th></tr>${rows.map(r=>`<tr><td>${r[0]}</td><td>${r[1]}</td></tr>`).join('')}</table>`);
+}
+
+function openTokenDetails() {
+    const sp = lastSplash;
+    const ol = lastOllama;
+    const gen = sp.decode_tokens || 0, pre = sp.prefill_tokens || 0, ca = sp.cache_reused_tokens || 0;
+    let rows = [
+        ['Splash · Qwen3.8-27B-4bit', fmtToks(ca), fmtToks(pre), fmtToks(gen)],
+    ];
+    if (ol && ol.count > 0) {
+        ol.models.forEach(m => rows.push([`Ollama · ${m.name}`, 'n/a', 'n/a', 'n/a']));
+    }
+    openModal('Token details', 'Splash: from Prometheus counters · Ollama: no token API',
+        `<table><tr><th>Model</th><th>Cached</th><th>Prefill</th><th>Generated</th></tr>` +
+        rows.map(r => `<tr><td>${r[0]}</td><td>${r[1]}</td><td>${r[2]}</td><td>${r[3]}</td></tr>`).join('') +
+        `<tr class="total"><td>TOTAL (splash)</td><td>${fmtToks(ca)}</td><td>${fmtToks(pre)}</td><td>${fmtToks(gen)}</td></tr></table>`);
+}
+
+function openActivityDetails() {
+    const items = [...activityLog].reverse();
+    const html = items.length
+        ? items.map(it => {
+            const ago = Math.floor((Date.now() - it.t) / 60000);
+            const t = ago < 1 ? 'now' : ago < 60 ? ago + 'm' : Math.floor(ago/60) + 'h ' + ago%60 + 'm';
+            return `<li><span class="act-time">${t}</span><span class="act-dot ${it.color}"></span><span class="act-text">${it.text}</span></li>`;
+        }).join('')
+        : '<li><span class="act-text">No activity yet</span></li>';
+    openModal('All activity', `${items.length} events since page load`, `<ul class="activity-list">${html}</ul>`);
+}
+
 fetchData();
 </script>
 </body>
@@ -997,6 +1108,7 @@ def _page():
     html = html.replace("54.5e9", f"{MEMORY_TOTAL_GB}e9")
     html = html.replace("Qwen3.8-27B-4bit", MODEL_NAME)
     html = html.replace("192.168.1.x", NODE_IP)
+    html = html.replace("__KWH_PRICE__", f"{KWH_PRICE}")
     return html
 
 @app.route('/')
