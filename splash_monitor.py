@@ -4,7 +4,8 @@ import requests
 import threading
 import re
 import sys
-from flask import Flask, render_template_string, jsonify
+from flask import Flask, render_template_string, jsonify, request
+from urllib.parse import urlparse
 
 app = Flask(__name__)
 
@@ -19,6 +20,14 @@ MEMORY_TOTAL_GB   = float(os.getenv("DASHSPLASH_MEM_GB",  "54.5"))    # unified 
 NODE_NAME         = os.getenv("DASHSPLASH_NODE_NAME",  "Mac Mini M5 Pro")
 NODE_IP           = os.getenv("DASHSPLASH_NODE_IP",    "192.168.1.x")
 PORT              = int(os.getenv("DASHSPLASH_PORT",   "8081"))
+
+# Base URLs (host:port only) so we can hit control endpoints that live
+# beside the metrics/ps paths. Used by the "release model" buttons.
+def _base(url):
+    p = urlparse(url)
+    return f"{p.scheme}://{p.netloc}"
+SPLASH_BASE = _base(SPLASH_URL)   # http://192.168.1.x:8000
+OLLAMA_BASE = _base(OLLAMA_URL)   # http://192.168.1.x:11434
 
 metrics_cache = {}
 macmon_cache = {}
@@ -324,6 +333,15 @@ body {
 }
 .model-name { font-size: 13px; font-weight: 600; color: #e8d5a3; }
 .model-ctx { font-size: 10px; color: var(--text-dim); background: rgba(255,255,255,0.06); padding: 2px 6px; border-radius: 4px; }
+.release-btn {
+    margin-left: 8px; cursor: pointer; user-select: none;
+    font-size: 10px; font-weight: 700; letter-spacing: 0.5px;
+    color: #ff8a8a; background: rgba(255,120,120,0.12);
+    border: 1px solid rgba(255,120,120,0.35); border-radius: 6px;
+    padding: 4px 9px; transition: all 0.15s;
+}
+.release-btn:hover { background: rgba(255,120,120,0.28); }
+.release-btn:disabled { opacity: 0.5; cursor: wait; }
 
 /* === AGGREGATE STATS === */
 .stats-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 16px; }
@@ -563,6 +581,7 @@ function renderNode(splash, macmon, ollama) {
             <span class="model-name">Qwen3.8-27B-4bit</span>
             <span class="model-ctx">4bit · ${splash.runtime || 'native'}</span>
             <span style="margin-left:auto;font-size:11px;color:var(--text-dim)">TTFT ${splash.ttft_p50?.toFixed(0) || '—'}ms · ITL ${splash.itl_p50?.toFixed(0) || '—'}ms</span>
+            <button class="release-btn" onclick="releaseModel('splash', this)">▼ RELEASE</button>
         </div>
 
         ${ollama && ollama.count > 0 ? `
@@ -574,6 +593,7 @@ function renderNode(splash, macmon, ollama) {
             <span class="model-ctx">${(mo.ram/1e9).toFixed(1)} GB RAM${mo.vram ? ' · ' + (mo.vram/1e9).toFixed(1) + ' GB GPU' : ''}</span>
             `).join('')}
             <span style="margin-left:auto;font-size:11px;color:var(--text-dim)">${ollama.count} model${ollama.count>1?'s':''} loaded</span>
+            <button class="release-btn" onclick="releaseModel('ollama', this)">▼ RELEASE</button>
         </div>` : ''}
     </div>`;
 }
@@ -897,6 +917,26 @@ function updateStatus(splash, macmon, ollama) {
         &nbsp; <span style="color:var(--text-mut)">${now}</span>`;
 }
 
+function releaseModel(engine, btn) {
+    if (!btn) return;
+    btn.disabled = true;
+    const orig = btn.textContent;
+    btn.textContent = '…';
+    fetch('/api/release', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({engine: engine}),
+    }).then(r => r.json()).then(res => {
+        btn.textContent = res.ok ? '✓ released' : '✗ ' + (res.status || res.error || 'failed');
+        if (engine === 'ollama' && res.models && res.models.length) {
+            btn.textContent = res.models.every(m => m.ok) ? '✓ all released' : '✗ ' + res.models.filter(m=>!m.ok).map(m=>m.model).join(', ');
+        }
+    }).catch(() => { btn.textContent = '✗ error'; })
+    .finally(() => {
+        setTimeout(() => { btn.disabled = false; btn.textContent = orig; }, 2500);
+    });
+}
+
 function fetchData() {
     Promise.all([
         fetch('/api/splash').then(r => r.json()).catch(() => ({})),
@@ -974,6 +1014,36 @@ def api_macmon():
 @app.route('/api/ollama')
 def api_ollama():
     return jsonify(ollama_cache.get('ollama', {}))
+
+@app.route('/api/release', methods=['POST'])
+def api_release():
+    """Release a model from RAM on demand.
+    body: {"engine": "splash"}  -> POST /v1/memory/release (splash 1.3.2+)
+          {"engine": "ollama"}  -> POST /api/chat keep_alive:0 for each loaded model
+    """
+    engine = (request.get_json(silent=True) or {}).get('engine', '')
+    try:
+        if engine == 'splash':
+            r = requests.post(f"{SPLASH_BASE}/v1/memory/release", timeout=10)
+            return jsonify({"engine": "splash", "ok": r.status_code in (200, 202), "status": r.status_code, "response": r.json() if r.headers.get('content-type','').startswith('application/json') else r.text[:200]})
+        if engine == 'ollama':
+            ol = ollama_cache.get('ollama', {})
+            unloaded = []
+            for mo in ol.get('models', []):
+                try:
+                    cr = requests.post(f"{OLLAMA_BASE}/api/chat", json={
+                        "model": mo['name'],
+                        "messages": [{"role": "user", "content": "bye"}],
+                        "stream": False,
+                        "keep_alive": 0,
+                    }, timeout=60)
+                    unloaded.append({"model": mo['name'], "ok": cr.status_code == 200})
+                except Exception as e:
+                    unloaded.append({"model": mo['name'], "ok": False, "error": str(e)[:120]})
+            return jsonify({"engine": "ollama", "ok": True, "models": unloaded})
+        return jsonify({"error": "engine must be 'splash' or 'ollama'"}), 400
+    except Exception as e:
+        return jsonify({"engine": engine, "ok": False, "error": str(e)[:200]}), 502
 
 if __name__ == '__main__':
     print(f"{NODE_NAME} Monitor on 0.0.0.0:{PORT}")
