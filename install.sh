@@ -5,7 +5,9 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")" && pwd)"
-DEPLOY_HOME="${DASHSPLASH_HOME:-/home/ubuntu}"
+DEPLOY_USER="${SUDO_USER:-$(id -un)}"
+# Home del usuario del servicio (no el HOME heredado, que con sudo es /root)
+DEPLOY_HOME="${DASHSPLASH_HOME:-$(getent passwd "$DEPLOY_USER" | cut -d: -f6)}"
 SVC_NAME="dashsplash"
 SVC_FILE="/etc/systemd/system/${SVC_NAME}.service"
 
@@ -41,7 +43,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=ubuntu
+User=$DEPLOY_USER
 WorkingDirectory=$DEPLOY_HOME
 ExecStart=$DEPLOY_HOME/dashsplash.sh
 ${ENV_LINE}

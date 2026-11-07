@@ -6,6 +6,8 @@ import re
 import sys
 import json
 import math
+import hmac
+from datetime import datetime
 from flask import Flask, render_template_string, jsonify, request
 from urllib.parse import urlparse
 
@@ -121,6 +123,8 @@ _ENERGY_DIR = os.getenv(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "energy"))
 _ENERGY_FILE = os.path.join(_ENERGY_DIR, "history.jsonl")
 _ENERGY_LOCK = threading.Lock()
+_ENERGY_REWRITE_GUARD = threading.Lock()   # one background rewrite at a time
+_ENERGY_REWRITE_RUNNING = False
 _ENERGY_SAMPLES = None          # [(t, sys_w, gpu_w, cpu_w)] ascending, lazy-loaded
 _ENERGY_APPENDS = 0
 _ENERGY_RETENTION_S = 90 * 86400   # keep 90 days
@@ -175,6 +179,50 @@ def _energy_rewrite(rows):
         os.replace(tmp, _ENERGY_FILE)
     except Exception as e:
         print(f"[ENERGY] rewrite failed ({_ENERGY_FILE}): {e}", flush=True)
+
+
+def _energy_write_row(f, row):
+    f.write(json.dumps({"t": round(row[0], 1), "sys": round(row[1], 2),
+                        "gpu": round(row[2], 2), "cpu": round(row[3], 2)}) + "\n")
+
+
+def _energy_rewrite_bg(snapshot):
+    """Rewrite history.jsonl off the poll thread (fire-and-forget).
+
+    Appends can keep landing while we write the snapshot, so the file is only
+    locked for the (cheap) merge of the rows added in the meantime plus the
+    atomic replace. Never stacks: a rewrite already in flight wins.
+    """
+    global _ENERGY_REWRITE_RUNNING
+    with _ENERGY_REWRITE_GUARD:
+        if _ENERGY_REWRITE_RUNNING:
+            return False
+        _ENERGY_REWRITE_RUNNING = True
+
+    def _run():
+        global _ENERGY_REWRITE_RUNNING
+        tmp = _ENERGY_FILE + ".tmp"
+        try:
+            os.makedirs(_ENERGY_DIR, exist_ok=True)
+            with open(tmp, "w", encoding="utf-8") as f:
+                for row in snapshot:
+                    _energy_write_row(f, row)
+            last_t = snapshot[-1][0] if snapshot else 0.0
+            with _ENERGY_LOCK:
+                fresh = [r for r in _energy_load() if r[0] > last_t]
+                if fresh:
+                    with open(tmp, "a", encoding="utf-8") as f:
+                        for row in fresh:
+                            _energy_write_row(f, row)
+                os.replace(tmp, _ENERGY_FILE)
+            print(f"[ENERGY] rewrite done ({len(snapshot)}+{len(fresh)} rows)", flush=True)
+        except Exception as e:
+            print(f"[ENERGY] background rewrite failed ({_ENERGY_FILE}): {e}", flush=True)
+        finally:
+            _ENERGY_REWRITE_RUNNING = False
+
+    threading.Thread(target=_run, daemon=True).start()
+    return True
 
 
 def _energy_thin(rows):
@@ -255,13 +303,14 @@ def energy_record(now, macmon):
         if (_ENERGY_APPENDS % 360 == 0 or len(rows) > _ENERGY_MAX_ROWS) and _energy_needs_thin(rows):
             thinned = _energy_thin(rows)
             rows[:] = thinned
-            _energy_rewrite(rows)
-            return          # the rewrite already persisted this sample
+            # Full-file rewrite (up to 400k rows) must never block the 5s poll
+            # loop: hand it to a daemon thread instead.
+            _energy_rewrite_bg(list(thinned))
+            return          # the background rewrite persists this sample
         try:
             os.makedirs(_ENERGY_DIR, exist_ok=True)
             with open(_ENERGY_FILE, "a", encoding="utf-8") as f:
-                f.write(json.dumps({"t": round(row[0], 1), "sys": round(row[1], 2),
-                                    "gpu": round(row[2], 2), "cpu": round(row[3], 2)}) + "\n")
+                _energy_write_row(f, row)
         except Exception as e:
             print(f"[ENERGY] append failed ({_ENERGY_FILE}): {e}", flush=True)
 
@@ -320,21 +369,23 @@ history = {
 }
 
 def fetch_llmstudio():
-    """LLM Studio is OpenAI-compatible but exposes no live T/s. We probe it
-    (throttled, bench every 120s) and accumulate completion tokens per model.
+    """LLM Studio is OpenAI-compatible but exposes no live T/s. We probe it and
+    accumulate completion tokens per model.
+
+    This only lists models (fast, 3s timeout) — the token bench is a slow
+    POST per model and runs on its own daemon thread (`llmstudio_bench_loop`)
+    so it can never stall the 5s poll loop.
 
     We read the model list from /api/v0/models (LM Studio native) because it
     carries `state` ("loaded"/"not-loaded"), so we only surface models that
     are actually resident in memory. If that endpoint is absent, we fall back
     to /v1/models and treat every listed model as loaded.
     """
-    global _llmstudio_last_bench
-    now = time.time()
     base = LLMSTUDIO_URL.rstrip('/')
     ids = []
     loaded = []          # list of (mid, meta_dict) for state=='loaded'
     try:
-        r = requests.get(f"{base}/api/v0/models", timeout=6)
+        r = requests.get(f"{base}/api/v0/models", timeout=3)
         for m in r.json().get("data", []):
             if not isinstance(m, dict):
                 continue
@@ -349,7 +400,7 @@ def fetch_llmstudio():
     if not ids:
         # fallback: OpenAI /v1/models (no state/meta) -> treat all as loaded
         try:
-            r = requests.get(f"{base}/v1/models", timeout=6)
+            r = requests.get(f"{base}/v1/models", timeout=3)
             for m in r.json().get("data", []):
                 if not isinstance(m, dict) or not m.get("id"):
                     continue
@@ -359,24 +410,6 @@ def fetch_llmstudio():
             return {"online": False, "count": 0, "models": [], "tps": 0, "ram_used": 0}
         loaded = [(mid, {}) for mid in ids]
     loaded_ids = [mid for mid, _ in loaded]
-    if now - _llmstudio_last_bench >= 120 and loaded_ids:
-        _llmstudio_last_bench = now
-        for mid in loaded_ids:
-            if mid not in llmstudio_ids:
-                llmstudio_ids[mid] = {"gen": 0, "tps": 0}
-            try:
-                t0 = time.time()
-                rr = requests.post(
-                    f"{base}/v1/chat/completions",
-                    json={"model": mid, "messages": [{"role": "user", "content": "di hola"}],
-                          "max_tokens": 8, "stream": False}, timeout=60)
-                u = (rr.json().get("usage") or {}).get("completion_tokens", 0)
-                llmstudio_ids[mid]["gen"] = llmstudio_ids[mid].get("gen", 0) + u
-                wall = max(time.time() - t0, 0.01)
-                if u:
-                    llmstudio_ids[mid]["tps"] = round(u / wall, 1)
-            except Exception:
-                pass
     models = []
     meta_by_id = {mid: meta for mid, meta in loaded}
     ram_total = 0
@@ -389,6 +422,49 @@ def fetch_llmstudio():
             "models": models,
             "ram_used": ram_total,
             "tps": round(sum(v.get("tps", 0) for v in llmstudio_ids.values()), 1)}
+
+
+LLMSTUDIO_BENCH_INTERVAL = float(os.getenv("DASHSPLASH_LLMSTUDIO_BENCH_S", "120"))
+
+
+def llmstudio_bench():
+    """Bench every loaded model once (one 8-token completion each, 10s cap).
+
+    Slow by nature: a cold local model can take seconds per call. Runs on its
+    own daemon thread only, never on the 5s poll loop.
+    """
+    global _llmstudio_last_bench
+    base = LLMSTUDIO_URL.rstrip('/')
+    ids = [m.get("id") for m in (llmstudio_cache.get("llmstudio") or {}).get("models", [])
+           if isinstance(m, dict) and m.get("id")]
+    for mid in ids:
+        if mid not in llmstudio_ids:
+            llmstudio_ids[mid] = {"gen": 0, "tps": 0}
+        try:
+            t0 = time.time()
+            rr = requests.post(
+                f"{base}/v1/chat/completions",
+                json={"model": mid, "messages": [{"role": "user", "content": "di hola"}],
+                      "max_tokens": 8, "stream": False}, timeout=10)
+            u = (rr.json().get("usage") or {}).get("completion_tokens", 0)
+            llmstudio_ids[mid]["gen"] = llmstudio_ids[mid].get("gen", 0) + u
+            wall = max(time.time() - t0, 0.01)
+            if u:
+                llmstudio_ids[mid]["tps"] = round(u / wall, 1)
+        except Exception:
+            continue
+    _llmstudio_last_bench = time.time()
+
+
+def llmstudio_bench_loop():
+    """Own cadence (default 120s) for the LLM Studio bench."""
+    time.sleep(15)                      # let the first listing populate the cache
+    while True:
+        try:
+            llmstudio_bench()
+        except Exception as e:
+            print(f"[LLMSTUDIO] bench failed: {e}", flush=True)
+        time.sleep(LLMSTUDIO_BENCH_INTERVAL)
 
 
 def fetch_opencodego():
@@ -406,14 +482,15 @@ def fetch_opencodego():
         return _go_cache
     key = (os.getenv('DASHSPLASH_OPENCODE_GO_KEY') or '').strip()
     if not key:
-        _go_cache = {'online': False, 'reason': 'no_api_key', 'windows': {}}
+        _go_cache = {'online': False, 'reason': 'no_api_key', 'windows': {},
+                     'fetched_at': int(now)}
         _go_last_fetch = now
         return _go_cache
     try:
         r = requests.get(
             OPENCODE_GO_USAGE_URL,
             headers={'Authorization': f'Bearer {key}'},
-            timeout=8)
+            timeout=2)          # non-essential: never let it slow the 5s loop
         if r.status_code != 200:
             _go_cache = {'online': False, 'reason': f'http_{r.status_code}', 'windows': {}}
             _go_last_fetch = now
@@ -682,6 +759,7 @@ def update_loop():
             pass
         # LLM Studio is on a reachable endpoint independent of splash/ollama, so
         # always update its cache even if the block above throws.
+        # (model listing only — the token bench runs on `llmstudio_bench_loop`)
         try:
             llmstudio = fetch_llmstudio()
             if llmstudio:
@@ -696,6 +774,8 @@ def update_loop():
         time.sleep(5)
 
 threading.Thread(target=update_loop, daemon=True).start()
+# LLM Studio token bench has its own cadence (slow POSTs) — never in the 5s loop.
+threading.Thread(target=llmstudio_bench_loop, daemon=True).start()
 
 DASHBOARD = '''<!DOCTYPE html>
 <html lang="en" data-theme="dark">
@@ -3045,7 +3125,6 @@ const countEl = document.getElementById('count');
 const liveEl = document.getElementById('live');
 const liveT = document.getElementById('live-t');
 const tickEl = document.getElementById('tick');
-const cards = new Map();
 const refs = new Map();
 let awaitingFirst = true;
 
@@ -3058,7 +3137,7 @@ function fmtElapsed(sec) {
     return h + 'h ' + String(m % 60).padStart(2, '0') + 'm';
 }
 
-function sparkHTML(spark, ac) {
+function sparkHTML(spark) {
     const n = 12, W = 64, H = 16, gap = 1.6, bw = (W - gap * (n - 1)) / n;
     const max = Math.max(1, ...spark);
     let out = '';
@@ -3113,9 +3192,6 @@ function makeCard(m) {
 }
 
 function updateCard(ref, m) {
-    const ac = m.status === 'ERROR' ? '#ea4335'
-             : m.status === 'VERIFYING' ? '#f9ab00'
-             : m.status === 'DONE' ? '#14b8a6' : '#34a853';
     ref.el.dataset.status = m.status;
     ref.chipT.textContent = m.status;
     ref.mid.textContent = m.id;
@@ -3125,10 +3201,16 @@ function updateCard(ref, m) {
     ref.sum.textContent = m.summary || 'working';
     ref.pct.textContent = m.percent + '%';
     ref.fill.style.width = Math.max(2, Math.min(100, m.percent)) + '%';
-    ref.stp.textContent = m.steps_total ? (m.tools + '/' + (m.steps_total * 3) + ' actions')
-                                        : (m.steps + ' steps');
+    // steps_total is only sent when the goal enumerates real steps
+    if (m.steps_total && m.steps_total >= 2) {
+        ref.stp.textContent = m.tools + '/' + (m.steps_total * 3) + ' actions';
+        ref.stp.style.display = '';
+    } else {
+        ref.stp.textContent = '';
+        ref.stp.style.display = 'none';
+    }
     ref.tool.textContent = m.last_action || 'think';
-    ref.spark.innerHTML = sparkHTML(m.spark || new Array(12).fill(0), ac);
+    ref.spark.innerHTML = sparkHTML(m.spark || new Array(12).fill(0));
 }
 
 function render(list) {
@@ -3230,7 +3312,7 @@ def api_opencodego():
 # ============================================================================
 DELEG_LIVE_DIR = os.getenv(
     "DASHSPLASH_DELEGATION_LIVE_DIR",
-    "/home/ubuntu/.hermes/cache/delegation/live",
+    os.path.expanduser("~/.hermes/cache/delegation/live"),
 )
 MINION_LIVE_WINDOW = float(os.getenv("DASHSPLASH_MINION_LIVE_WINDOW", "120"))
 
@@ -3240,15 +3322,23 @@ _MINION_STEP_RE = re.compile(r"(?:^|[\s(])(\d{1,2})[).]\s+\S")
 # Secrets that may leak from a child's transcript (config dumps, curl headers).
 # Everything served by /api/minions goes through _minion_scrub().
 _SECRET_PATTERNS = [
-    (re.compile(r"oc_sk_[A-Za-z0-9_\-]+"), "[redacted]"),
-    (re.compile(r"sk-ant-[A-Za-z0-9_\-]{16,}"), "[redacted]"),
-    (re.compile(r"sk-[A-Za-z0-9]{20,}"), "[redacted]"),
-    (re.compile(r"ghp_[A-Za-z0-9]{20,}"), "[redacted]"),
-    (re.compile(r"github_pat_[A-Za-z0-9_]{20,}"), "[redacted]"),
-    (re.compile(r"xox[baprs]-[A-Za-z0-9\-]{10,}"), "[redacted]"),
-    (re.compile(r"eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}"), "[redacted]"),
+    (re.compile(r"oc[_]sk_[A-Za-z0-9_\-]+"), "***REDACTED***"),
+    (re.compile(r"sk-ant-[A-Za-z0-9_\-]{16,}"), "***REDACTED***"),
+    (re.compile(r"sk-[A-Za-z0-9]{20,}"), "***REDACTED***"),
+    (re.compile(r"ghp_[A-Za-z0-9]{20,}"), "***REDACTED***"),
+    (re.compile(r"github_pat_[A-Za-z0-9_]{20,}"), "***REDACTED***"),
+    (re.compile(r"xox[baprs]-[A-Za-z0-9\-]{10,}"), "***REDACTED***"),
+    (re.compile(r"eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}"), "***REDACTED***"),
+    # AWS access key id
+    (re.compile(r"AKIA[0-9A-Z]{16}"), "***REDACTED***"),
+    # key=value / key: value assignments (api_key=..., token: ..., password=hunter2)
+    (re.compile(r"(?i)\b(api[_-]?key|token|password|passwd|secret)\b(\s*[:=]\s*)[\"']?[^\s\"',;}]+"),
+     r"\1\2***REDACTED***"),
 ]
 _SECRET_BEARER = re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._\-]{16,}")
+# Generic high-entropy-ish token: long, and mixing letters with digits (so a
+# plain 28+ char word or slug is left alone). Catches bare hex/base64 dumps.
+_SECRET_LONG_TOKEN = re.compile(r"[A-Za-z0-9_\-]{28,}")
 
 
 def _minion_scrub(value):
@@ -3258,8 +3348,26 @@ def _minion_scrub(value):
     s = str(value)
     for pat, repl in _SECRET_PATTERNS:
         s = pat.sub(repl, s)
-    s = _SECRET_BEARER.sub(lambda m: m.group(1) + "[redacted]", s)
-    return s
+    s = _SECRET_BEARER.sub(lambda m: m.group(1) + "***REDACTED***", s)
+
+    def _long_tok(m):
+        tok = m.group(0)
+        if any(c.isdigit() for c in tok) and any(c.isalpha() for c in tok):
+            return "***REDACTED***"
+        return tok
+
+    return _SECRET_LONG_TOKEN.sub(_long_tok, s)
+
+
+def _minion_scrub_obj(value):
+    """Recursively scrub every string in a JSON-ready structure."""
+    if isinstance(value, str):
+        return _minion_scrub(value)
+    if isinstance(value, dict):
+        return {k: _minion_scrub_obj(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_minion_scrub_obj(v) for v in value]
+    return value
 
 
 def _minion_role(t):
@@ -3351,7 +3459,9 @@ def _minion_read_log(path):
     # normalise timestamps to epoch seconds (seconds-of-day -> today, with a
     # midnight guard so a log started at 23:58 still reads correctly at 00:05).
     now = time.time()
-    today0 = now - (now % 86400) + time.timezone  # local midnight, cheap approx
+    # local midnight via datetime (time.timezone ignores DST -> 1h off in CEST)
+    today0 = datetime.now().replace(hour=0, minute=0, second=0,
+                                    microsecond=0).timestamp()
     for b in parsed["blocks"]:
         if b["ts"] is not None and b["ts"] < 86400:
             b["ts"] = today0 + b["ts"]
@@ -3361,6 +3471,30 @@ def _minion_read_log(path):
 
 
 _MINION_CACHE = {}
+_MINION_CACHE_MAX = 64
+
+
+def _minion_cache_prune(now=None):
+    """Drop transcripts for files that vanished or left the live window.
+
+    The cache holds fully parsed transcripts (dicts with every block), so it
+    must not grow with the delegation history — only live tasks deserve a slot.
+    """
+    now = time.time() if now is None else now
+    for path in list(_MINION_CACHE):
+        try:
+            st = os.stat(path)
+        except OSError:
+            _MINION_CACHE.pop(path, None)
+            continue
+        if now - st.st_mtime > MINION_LIVE_WINDOW * 2:
+            _MINION_CACHE.pop(path, None)
+    if len(_MINION_CACHE) > _MINION_CACHE_MAX:
+        newest = sorted(_MINION_CACHE.items(),
+                        key=lambda kv: kv[1][0][0] if kv[1] and kv[1][0] else 0,
+                        reverse=True)
+        for path, _ in newest[_MINION_CACHE_MAX:]:
+            _MINION_CACHE.pop(path, None)
 
 
 def _minion_log(path):
@@ -3469,6 +3603,19 @@ def _minion_goal_steps(goal):
     return max(nums) if nums else 0
 
 
+MINION_GOAL_CHARS = 120
+
+
+def _minion_short_goal(goal, limit=MINION_GOAL_CHARS):
+    """The /minions panel is served unauthenticated on the LAN: never echo a
+    child's full goal (it can carry prompts, paths, secrets). Keep a short
+    prefix — the delegation id already identifies the task."""
+    s = " ".join(str(goal or "").split())
+    if len(s) <= limit:
+        return s
+    return s[:limit].rstrip() + "…"
+
+
 def _minion_build(deleg_id, task_idx, data, manifest):
     blocks = data["blocks"] or []
     now = time.time()
@@ -3487,7 +3634,7 @@ def _minion_build(deleg_id, task_idx, data, manifest):
     if not summary or generic:
         # a truncated shell blob says nothing useful -> fall back to the last
         # sentence the agent actually wrote about what it is doing
-        for b in list(reversed(blocks))[-8:]:
+        for b in list(reversed(blocks))[:8]:
             if b["role"] in ("assistant", "think"):
                 prose = _minion_words(b["text"], 8)
                 if len(prose) > 12:
@@ -3520,9 +3667,12 @@ def _minion_build(deleg_id, task_idx, data, manifest):
         percent = 100
     elif total_steps >= 2:
         done_steps = min(total_steps, tools_done / 3.0)
-        percent = int(max(3, min(95, 100.0 * done_steps / total_steps)))
+        percent = int(max(3, min(90, 100.0 * done_steps / total_steps)))
     else:
-        percent = int(max(4, min(95, tools_done * 12)))
+        percent = int(max(4, min(90, tools_done * 12)))
+    # while still working, never claim completion
+    if status in ("WORKING", "VERIFYING"):
+        percent = min(percent, 90)
     if status == "ERROR":
         percent = max(percent, 5)
 
@@ -3542,9 +3692,9 @@ def _minion_build(deleg_id, task_idx, data, manifest):
         if 0 <= age < 120:
             spark[11 - int(age // 10)] += 1
 
-    return {
+    item = {
         "id": f"{deleg_id}#{task_idx}",
-        "goal": _minion_scrub((data.get("goal") or "")[:400]),
+        "goal": _minion_scrub(_minion_short_goal(data.get("goal"))),
         "summary": _minion_scrub(summary),
         "percent": percent,
         "status": status,
@@ -3554,8 +3704,12 @@ def _minion_build(deleg_id, task_idx, data, manifest):
         "steps": len(blocks),
         "tools": tools_done,
         "spark": spark,
-        "steps_total": total_steps,
     }
+    # Only surface the step counter when the goal actually enumerates steps;
+    # for a 1-step goal the numbers are meaningless ("47/3 actions").
+    if total_steps >= 2:
+        item["steps_total"] = total_steps
+    return item
 
 
 def scan_minions():
@@ -3600,6 +3754,7 @@ def scan_minions():
             item = _minion_build(deleg_id, idx, data, meta)
             item["mtime"] = int(data["mtime"])
             out.append(item)
+    _minion_cache_prune(now)
     out.sort(key=lambda x: x.get("mtime", 0), reverse=True)
     return out
 
@@ -3607,7 +3762,8 @@ def scan_minions():
 @app.route("/api/minions")
 def api_minions():
     try:
-        return jsonify(scan_minions())
+        # every string that leaves the process goes through _minion_scrub
+        return jsonify(_minion_scrub_obj(scan_minions()))
     except Exception as e:  # never 500 the panel
         print(f"[MINIONS] scan failed: {e}", flush=True)
         return jsonify([])
@@ -3663,8 +3819,6 @@ def api_release():
         return jsonify({"engine": engine, "ok": False, "error": str(e)[:200]}), 502
 
 # ─── Settings store (theme, refresh, background, card order/visibility, …) ──
-import json
-
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.getenv("DASHSPLASH_DATA_DIR", os.path.join(BASE_DIR, "data"))
 SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
@@ -3676,6 +3830,7 @@ DEFAULT_SETTINGS = {
     "cardOrder": [],
     "cardVisible": {},
     "energyRange": "1h",
+    "mode": "auto",          # cards per row: auto | onecol | twocol
 }
 
 SETTINGS = dict(DEFAULT_SETTINGS)
@@ -3726,12 +3881,95 @@ def api_settings_get():
     return jsonify(SETTINGS)
 
 
+# Optional shared token for the state-changing routes. Unset (default) = open,
+# which keeps the LAN dashboard working exactly as before.
+ADMIN_TOKEN = (os.getenv("DASHSPLASH_ADMIN_TOKEN") or "").strip()
+
+
+def _admin_guard():
+    """None if the request may mutate state, else a 401 response."""
+    if not ADMIN_TOKEN:
+        return None
+    got = (request.headers.get("X-Admin-Token") or "").strip()
+    if got and hmac.compare_digest(got, ADMIN_TOKEN):
+        return None
+    return jsonify({"ok": False, "error": "unauthorized: send X-Admin-Token"}), 401
+
+
+_SETTINGS_ALLOWED = ("theme", "refreshMs", "bgFile", "cardOrder", "cardVisible",
+                     "energyRange", "mode")
+
+
+def _clean_settings(body):
+    """Whitelist + range-validate a settings patch. Returns (clean, errors).
+
+    Only keys from DEFAULT_SETTINGS are accepted — an unauthenticated LAN
+    client must never be able to inject arbitrary keys into settings.json.
+    """
+    clean, errors = {}, []
+    for key, val in body.items():
+        if key == "theme":
+            if val in ("dark", "light"):
+                clean[key] = val
+            else:
+                errors.append("theme must be 'dark' or 'light'")
+        elif key == "refreshMs":
+            try:
+                iv = int(float(val))
+            except (TypeError, ValueError):
+                errors.append("refreshMs must be a number")
+                continue
+            if 500 <= iv <= 600000:
+                clean[key] = iv
+            else:
+                errors.append("refreshMs must be within 500..600000")
+        elif key == "bgFile":
+            if val is None:
+                clean[key] = None
+            else:
+                name = _bg_safe_name(val)
+                if name:
+                    clean[key] = name
+                else:
+                    errors.append("bgFile must be an allowed image filename or null")
+        elif key == "cardOrder":
+            if isinstance(val, list) and len(val) <= 40 and all(isinstance(v, str) and len(v) <= 64 for v in val):
+                clean[key] = val
+            else:
+                errors.append("cardOrder must be a list of up to 40 short strings")
+        elif key == "cardVisible":
+            if isinstance(val, dict) and len(val) <= 40 and all(
+                    isinstance(k, str) and len(k) <= 64 and isinstance(v, bool) for k, v in val.items()):
+                clean[key] = val
+            else:
+                errors.append("cardVisible must map card ids to booleans")
+        elif key == "energyRange":
+            if val in ENERGY_RANGES:
+                clean[key] = val
+            else:
+                errors.append("energyRange must be one of " + ", ".join(ENERGY_RANGES))
+        elif key == "mode":
+            if val in ("auto", "onecol", "twocol"):
+                clean[key] = val
+            else:
+                errors.append("mode must be 'auto', 'onecol' or 'twocol'")
+        else:
+            errors.append(f"unknown setting: {key}")
+    return clean, errors
+
+
 @app.route('/api/settings', methods=['POST'])
 def api_settings_post():
+    deny = _admin_guard()
+    if deny:
+        return deny
     body = request.get_json(silent=True)
     if not isinstance(body, dict):
         return jsonify({"error": "body must be a JSON object"}), 400
-    save_settings(body)
+    clean, errors = _clean_settings(body)
+    if errors:
+        return jsonify({"ok": False, "error": "; ".join(errors)}), 400
+    save_settings(clean)
     return jsonify(SETTINGS)
 
 
@@ -3771,6 +4009,9 @@ def api_bg_get():
 def api_bg_post():
     """Accept a multipart file field 'image' OR JSON {image: 'data:image/...;base64,...'}.
     JSON {clear: true} removes the background. Persists SETTINGS.bgFile."""
+    deny = _admin_guard()
+    if deny:
+        return deny
     import base64
     from flask import send_from_directory  # noqa: F401  (kept local: used by /bg route)
 
@@ -3905,6 +4146,9 @@ def api_energy_summary():
 @app.route('/api/energy/clear', methods=['POST'])
 def api_energy_clear():
     """Wipe the persisted power history (used by the admin 'borrar historial')."""
+    deny = _admin_guard()
+    if deny:
+        return deny
     with _ENERGY_LOCK:
         rows = _energy_load()
         removed = len(rows)

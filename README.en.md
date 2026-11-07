@@ -25,12 +25,13 @@ Real-time monitoring dashboard for **Splash** (LLM inference engine on Apple Sil
 | **Token totals** | Splash | Generated / Cached / Prefill, per-model table |
 | **Activity** | Splash + macmon + Ollama | Live log (decode started/finished, thermal, GPU hot, Ollama models loaded/unloaded) + **Thinking** indicator from `/api/splash_status`, with a **LIVE / PAUSED** toggle |
 | **OpenCode Go quota** | OpenCode Go usage API | % used of the rolling/weekly/monthly windows + time to reset (120 s throttle) |
-| **Admin panel** | `data/settings.json` | Custom background, columns and card order, visible cards, energy range, refresh interval and light/dark theme |
+| **Admin panel** | `data/settings.json` | Custom background, columns and card order, visible cards, energy range and refresh interval (the light/dark theme lives in `localStorage`) |
+| **Minions** | Hermes delegation transcripts | Separate `/minions` page: one card per minion with summary, progress %, status and sparkline (3 s refresh) |
 | **Charts** | Splash + macmon | GPU temp, power, throughput (5 min lines) |
 
 ## New features (unreleased)
 
-These four features are already on `main` but have no tagged release yet.
+These five features are already on `main` but have no tagged release yet.
 
 ### 1. OpenCode Go quota panel
 
@@ -67,7 +68,7 @@ DASHSPLASH_OPENCODE_GO_KEY="your_key_here"   # your real key; the repo only carr
 
 ### 3. Admin / personalization panel
 
-Settings button in the header (next to the theme one). Everything is persisted server-side (`data/settings.json`, `GET`/`POST /api/settings`) and re-applied on reload:
+Settings button in the header (next to the theme one). Everything in the table below is persisted server-side (`data/settings.json`, `GET`/`POST /api/settings`) and re-applied on reload. The **light/dark theme** is the exception: it is a client-side setting stored in `localStorage`, never in `settings.json`:
 
 | Section | Options |
 |---|---|
@@ -76,13 +77,31 @@ Settings button in the header (next to the theme one). Everything is persisted s
 | **Cards** | Show/hide each dashboard card |
 | **Energy** | Default range for the energy block: `1h`, `24h`, `1 week`, `1 month`, `3 months` |
 | **Refresh** | Presets 1 s / 3 s / 5 s / 10 s / 30 s / 1 min, or a custom interval (0.5–600 s) |
-| **Theme** | Light / dark; quick toggle in the header, persisted in `localStorage` |
 
 Background files live in `data/bg/`; `data/` is **gitignored**, so photos and settings are never pushed.
+
+The three state-changing endpoints (`POST /api/settings`, `POST /api/bg`, `POST /api/energy/clear`) validate keys against the existing schema and, if you set `DASHSPLASH_ADMIN_TOKEN`, require the `X-Admin-Token` header (401 when missing or wrong). Without the variable everything stays open as before.
 
 ### 4. Activity LIVE / PAUSED
 
 *Recent activity* has a toggle in the card header: `LIVE` while the feed updates and `PAUSED` (button in `OFF`) when paused, which hides the list and the *View all activity* button. The state is stored in `localStorage` (`dashsplash.activityOn`), survives reloads and does not affect the rest of the dashboard.
+
+### 5. Live minions panel
+
+`/minions` is its own page (dark-neon styling, with a `← DASHBOARD` link back) that shows the **live Hermes subagents** on this host, one card each:
+
+| Element | What it shows |
+|---|---|
+| **Summary** | The minion's current action in plain language (from the last `tool` block of its transcript: `terminal(git push)` → "Pushing to git") |
+| **Progress** | 0–100 % (capped at 90 while working, 100 only when finished) plus an action counter when the goal enumerates real steps |
+| **Status** | `WORKING` / `VERIFYING` / `DONE` / `ERROR`, with a per-status chip and colour |
+| **Activity** | 12-bar sparkline (10 s buckets, last 2 min) + elapsed time |
+
+- **Endpoint**: `GET /api/minions` → JSON array with `id` (delegation + index), `goal` (truncated to 120 chars), `summary`, `percent`, `status`, `started`, `elapsed`, `last_action`, `steps`, `tools`, `spark` and `steps_total` (only when the goal has ≥ 2 steps).
+- **3 s refresh** with per-`id` reconciliation: cards are updated in place (no full re-render), so the in/out animations work.
+- **Data source**: the live transcripts Hermes writes to `DASHSPLASH_DELEGATION_LIVE_DIR` (default `~/.hermes/cache/delegation/live`). A `task-<N>.log` counts as live while its mtime stays within `DASHSPLASH_MINION_LIVE_WINDOW` (120 s by default). The parser accepts both the JSON shape and the append-only text shape (`HH:MM:SS role | text`) and caches by `(mtime, size)`.
+- **Security**: everything served by `/api/minions` goes through a credential scrub (`oc_sk…`, `sk-…`, `Bearer …`, JWT, `ghp_…`, `AKIA…`, `api_key=…/token=…/password=…` and long alphanumeric tokens). The route is **not** token-protected, which is why the `goal` is served truncated instead of verbatim.
+- **Optional token**: if you set `DASHSPLASH_ADMIN_TOKEN`, the state-changing routes require `X-Admin-Token` (see section 3); `/minions` and `/api/minions` stay read-only and unauthenticated (it is a LAN panel).
 
 ## Architecture
 
@@ -216,6 +235,13 @@ Everything is configured with **environment variables** (or a `.env` file that t
    # OpenCode Go — delegation quota (optional)
    DASHSPLASH_OPENCODE_GO_URL="https://opencode.ai/zen/go/v1/usage"
    DASHSPLASH_OPENCODE_GO_KEY="your_key_here"   # without a key the panel stays inert
+
+   # /minions panel — where Hermes writes the live transcripts (optional)
+   DASHSPLASH_DELEGATION_LIVE_DIR="$HOME/.hermes/cache/delegation/live"
+   DASHSPLASH_MINION_LIVE_WINDOW="120"          # seconds of silence = minion gone
+
+   # Optional shared token for the state-changing routes (empty = open LAN)
+   # DASHSPLASH_ADMIN_TOKEN="change_me"
    ```
 
 3. **Restart** the service to pick up the changes:
@@ -230,7 +256,7 @@ Without a `.env`, the dashboard starts with default values (`127.0.0.1`) — han
 
 | File | Description |
 |---|---|
-| `splash_monitor.py` | Flask server + the dashboard HTML/JS (~880 lines) |
+| `splash_monitor.py` | Flask server + dashboard and `/minions` panel HTML/JS (~4200 lines) |
 | `dashsplash.sh` | Launcher: resolves the Python binary and starts the monitor |
 | `systemd/dashsplash.service` | systemd service (starts on boot, `Restart=always`) |
 | `install.sh` | Install script (copies the service, enables, starts) |

@@ -3,11 +3,13 @@ Description=DashSplash MAC - Mac Mini M5 Pro Splash+Macmon monitor dashboard
 After=network-online.target
 Wants=network-online.target
 
+# Reference unit. `sudo bash install.sh` generates the real file at
+# /etc/systemd/system/dashsplash.service, filling in User=<deploying user>
+# and the deploy paths. %h below is that user's home directory.
 [Service]
 Type=simple
-User=ubuntu
-WorkingDirectory=/home/ubuntu
-ExecStart=/home/ubuntu/dashsplash.sh
+WorkingDirectory=%h
+ExecStart=%h/dashsplash.sh
 Restart=always
 RestartSec=3
 Environment=PYTHONUNBUFFERED=1
