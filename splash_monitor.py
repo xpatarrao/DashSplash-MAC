@@ -806,7 +806,7 @@ html[data-theme="light"] {
     width: 30px; height: 28px; font-size: 14px; line-height: 1;
     color: var(--text-dim); background: var(--hover-mid);
     border: 1px solid var(--border); border-radius: 7px;
-    cursor: pointer; transition: background .15s, color .15s, border-color .15s;
+    cursor: pointer; text-decoration: none; transition: background .15s, color .15s, border-color .15s;
 }
 .icon-btn:hover { background: var(--hover-strong); color: var(--text); }
 .icon-btn.active { color: var(--green); border-color: var(--green-border); background: var(--green-bg); }
@@ -1177,6 +1177,7 @@ body.has-bg .admin-panel { background: var(--card-glass-alt, var(--panel-bg)); b
     <div class="header-right">
         <div class="header-tools">
             <button class="icon-btn" id="theme-btn" type="button" title="Cambiar tema (claro/oscuro)" aria-label="Cambiar tema"><span id="theme-btn-icon">☀</span></button>
+            <a class="icon-btn" href="/minions" title="Minions (subagents en vivo)" aria-label="Minions">▦</a>
             <button class="icon-btn" id="admin-btn" type="button" title="Ajustes" aria-label="Ajustes" aria-expanded="false" aria-controls="admin-panel">⚙</button>
         </div>
         <div id="header-status"></div>
@@ -2755,6 +2756,436 @@ function openActivityDetails() {
 </body>
 </html>'''
 
+MINIONS_HTML = '''<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Minions · live</title>
+<style>
+:root {
+    --bg: #080a0f;
+    --panel: #101520;
+    --panel-2: #0c1019;
+    --border: #212a38;
+    --text: #e8eaed;
+    --dim: #8f98a8;
+    --mut: #4f5967;
+    --green: #34a853;
+    --orange: #f9ab00;
+    --red: #ea4335;
+    --blue: #4285f4;
+    --purple: #a144fb;
+    --teal: #14b8a6;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, "JetBrains Mono", Consolas, monospace;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { min-height: 100%; }
+body {
+    background-color: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background-image:
+        radial-gradient(1100px 520px at 12% -12%, rgba(52,168,83,0.10), transparent 62%),
+        radial-gradient(900px 460px at 88% -6%, rgba(66,133,244,0.10), transparent 58%),
+        radial-gradient(700px 500px at 50% 115%, rgba(161,68,251,0.07), transparent 60%),
+        linear-gradient(rgba(255,255,255,0.020) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255,255,255,0.020) 1px, transparent 1px);
+    background-size: auto, auto, auto, 44px 44px, 44px 44px;
+    background-attachment: fixed;
+    min-height: 100vh;
+}
+
+/* ---------- header ---------- */
+header {
+    position: sticky; top: 0; z-index: 20;
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 18px; flex-wrap: wrap;
+    padding: 18px 30px 16px;
+    border-bottom: 1px solid var(--border);
+    background: linear-gradient(180deg, rgba(8,10,15,0.94), rgba(8,10,15,0.74));
+    backdrop-filter: blur(10px);
+}
+.h-left { display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap; }
+h1 {
+    font-family: var(--mono);
+    font-size: 21px; font-weight: 700; letter-spacing: 0.34em;
+    color: #eaf6ee;
+    text-shadow: 0 0 18px rgba(52,168,83,0.55), 0 0 44px rgba(52,168,83,0.22);
+}
+.h-sub { font-family: var(--mono); font-size: 11px; letter-spacing: 0.14em; color: var(--mut); text-transform: uppercase; }
+.h-right { display: flex; align-items: center; gap: 14px; }
+.live-wrap {
+    display: inline-flex; align-items: center; gap: 9px;
+    padding: 7px 13px 7px 11px;
+    border: 1px solid rgba(52,168,83,0.34);
+    border-radius: 999px;
+    background: rgba(52,168,83,0.08);
+    font-family: var(--mono); font-size: 11px; letter-spacing: 0.22em; color: #9df3ba;
+}
+.live-dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--green);
+    box-shadow: 0 0 10px var(--green), 0 0 22px rgba(52,168,83,0.6);
+    animation: beat 1.6s ease-in-out infinite;
+}
+.live-wrap.off { border-color: rgba(234,67,53,0.4); background: rgba(234,67,53,0.08); color: #ff9d93; }
+.live-wrap.off .live-dot { background: var(--red); box-shadow: 0 0 10px var(--red); animation: none; }
+.count {
+    min-width: 40px; text-align: center;
+    font-family: var(--mono); font-size: 13px; font-weight: 700;
+    padding: 6px 11px; border-radius: 9px;
+    color: #cdebd8; border: 1px solid rgba(52,168,83,0.28);
+    background: rgba(52,168,83,0.09);
+}
+.count.zero { color: var(--mut); border-color: var(--border); background: rgba(255,255,255,0.03); }
+.back {
+    font-family: var(--mono); font-size: 11px; letter-spacing: 0.12em;
+    color: var(--dim); text-decoration: none;
+    border: 1px solid var(--border); border-radius: 8px;
+    padding: 7px 11px; background: rgba(255,255,255,0.03);
+    transition: color .2s, border-color .2s, background .2s;
+}
+.back:hover { color: var(--text); border-color: rgba(52,168,83,0.4); background: rgba(52,168,83,0.08); }
+
+@keyframes beat { 0%,100% { opacity:1; transform:scale(1);} 50% { opacity:.35; transform:scale(.82);} }
+
+/* ---------- grid ---------- */
+main { padding: 26px 30px 90px; max-width: 1680px; margin: 0 auto; }
+#grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+    gap: 18px;
+}
+
+/* ---------- card ---------- */
+.mcard {
+    --ac: var(--green);
+    position: relative;
+    border-radius: 15px;
+    padding: 15px 17px 13px 19px;
+    background: linear-gradient(158deg, rgba(19,24,34,0.96), rgba(11,14,21,0.98));
+    border: 1px solid var(--border);
+    box-shadow: 0 14px 34px rgba(0,0,0,0.42), inset 0 1px 0 rgba(255,255,255,0.03);
+    overflow: hidden;
+    transition: transform .25s ease, border-color .25s ease, box-shadow .25s ease;
+}
+.mcard::before {
+    content: ""; position: absolute; left: 0; top: 12px; bottom: 12px; width: 2px;
+    border-radius: 2px; background: var(--ac);
+    box-shadow: 0 0 14px var(--ac), 0 0 32px var(--ac);
+    opacity: .95;
+}
+.mcard::after {
+    content: ""; position: absolute; inset: 0; pointer-events: none;
+    background: radial-gradient(520px 120px at 0% 0%, color-mix(in srgb, var(--ac) 13%, transparent), transparent 70%);
+    opacity: .55;
+}
+.mcard:hover { transform: translateY(-2px); border-color: color-mix(in srgb, var(--ac) 45%, var(--border)); box-shadow: 0 18px 44px rgba(0,0,0,0.5), 0 0 0 1px color-mix(in srgb, var(--ac) 22%, transparent); }
+.mcard.enter { animation: cardIn .46s cubic-bezier(.18,.86,.24,1) both; }
+.mcard.leave { animation: cardOut .3s ease-in forwards; pointer-events: none; }
+@keyframes cardIn { from { opacity: 0; transform: translateY(14px) scale(.975); } to { opacity: 1; transform: none; } }
+@keyframes cardOut { to { opacity: 0; transform: translateY(-8px) scale(.97); } }
+
+.mcard[data-status="WORKING"]   { --ac: var(--green); }
+.mcard[data-status="VERIFYING"] { --ac: var(--orange); }
+.mcard[data-status="DONE"]      { --ac: var(--teal); }
+.mcard[data-status="ERROR"]     { --ac: var(--red); }
+
+.mtop { display: flex; align-items: center; gap: 10px; }
+.chip {
+    display: inline-flex; align-items: center; gap: 7px;
+    font-family: var(--mono); font-size: 10px; font-weight: 700; letter-spacing: 0.16em;
+    padding: 4px 9px 4px 8px; border-radius: 999px;
+    color: var(--ac);
+    border: 1px solid color-mix(in srgb, var(--ac) 38%, transparent);
+    background: color-mix(in srgb, var(--ac) 11%, transparent);
+}
+.chip .d { width: 6px; height: 6px; border-radius: 50%; background: var(--ac); box-shadow: 0 0 8px var(--ac); }
+.mcard[data-status="WORKING"] .chip .d { animation: beat 1.3s ease-in-out infinite; }
+.mid {
+    font-family: var(--mono); font-size: 10px; color: var(--mut);
+    letter-spacing: 0.06em; margin-left: auto;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 45%;
+}
+.elapsed { font-family: var(--mono); font-size: 10.5px; color: var(--dim); letter-spacing: 0.08em; }
+
+.goal {
+    margin-top: 11px;
+    font-size: 12.5px; line-height: 1.42; color: var(--dim);
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+    overflow: hidden;
+}
+.summary {
+    margin-top: 9px;
+    display: flex; align-items: baseline; gap: 8px;
+    font-size: 16px; font-weight: 600; color: #eef4ff;
+    letter-spacing: -0.01em;
+    min-height: 22px;
+}
+.summary .caret { color: var(--ac); font-size: 12px; text-shadow: 0 0 10px var(--ac); transform: translateY(-1px); }
+.sum-t { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.prow { display: flex; align-items: center; gap: 11px; margin-top: 14px; }
+.pct {
+    font-family: var(--mono); font-size: 13px; font-weight: 700; color: var(--ac);
+    text-shadow: 0 0 14px color-mix(in srgb, var(--ac) 55%, transparent);
+    min-width: 42px; letter-spacing: 0.02em;
+}
+.pbar {
+    position: relative; flex: 1; height: 7px; border-radius: 999px;
+    background: #1a2130; overflow: hidden;
+    box-shadow: inset 0 1px 2px rgba(0,0,0,0.6);
+}
+.pbar-fill {
+    position: relative; height: 100%; width: 0%; border-radius: 999px;
+    background: linear-gradient(90deg, color-mix(in srgb, var(--ac) 55%, #0a0d13), var(--ac));
+    box-shadow: 0 0 12px var(--ac), 0 0 26px color-mix(in srgb, var(--ac) 45%, transparent);
+    transition: width .7s cubic-bezier(.2,.8,.2,1);
+    overflow: hidden;
+}
+.pbar-fill::after {
+    content: ""; position: absolute; inset: 0;
+    background: repeating-linear-gradient(115deg, rgba(255,255,255,0.22) 0 5px, transparent 5px 12px);
+    animation: slide 1.1s linear infinite;
+}
+.mcard[data-status="DONE"] .pbar-fill::after,
+.mcard[data-status="ERROR"] .pbar-fill::after { animation: none; opacity: .35; }
+@keyframes slide { from { transform: translateX(-14px); } to { transform: translateX(0); } }
+.stp { font-family: var(--mono); font-size: 10px; color: var(--mut); letter-spacing: 0.06em; white-space: nowrap; }
+
+.mfoot {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 12px; margin-top: 13px; padding-top: 11px;
+    border-top: 1px dashed rgba(255,255,255,0.07);
+}
+.toolchip {
+    font-family: var(--mono); font-size: 10px; letter-spacing: 0.1em;
+    color: var(--dim);
+    padding: 3px 7px; border-radius: 6px;
+    border: 1px solid rgba(255,255,255,0.09);
+    background: rgba(255,255,255,0.035);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 55%;
+}
+.toolchip::before { content: "▸ "; color: var(--ac); }
+.spark { width: 96px; height: 18px; flex: 0 0 auto; overflow: visible; }
+.spark rect { fill: var(--ac); opacity: .28; transition: opacity .3s; }
+.spark rect.hi { opacity: .95; filter: drop-shadow(0 0 3px var(--ac)); }
+.spark-empty { font-family: var(--mono); font-size: 9px; color: var(--mut); letter-spacing: .1em; }
+
+/* ---------- empty state ---------- */
+#empty {
+    display: none;
+    flex-direction: column; align-items: center; justify-content: center;
+    gap: 14px; padding: 110px 20px 130px; text-align: center;
+}
+#empty.show { display: flex; }
+.empty-glyph {
+    font-family: var(--mono); font-size: 58px; line-height: 1;
+    color: #1d2431;
+    text-shadow: 0 0 34px rgba(52,168,83,0.16);
+    animation: drift 6s ease-in-out infinite;
+}
+@keyframes drift { 0%,100% { transform: translateY(0); opacity: .85; } 50% { transform: translateY(-7px); opacity: 1; } }
+.empty-t { font-family: var(--mono); font-size: 13px; letter-spacing: 0.18em; color: var(--mut); text-transform: uppercase; }
+.empty-s { font-family: var(--mono); font-size: 10.5px; color: #2f3846; letter-spacing: 0.1em; }
+
+/* ---------- footer ---------- */
+footer {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 15;
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 12px; padding: 8px 30px;
+    font-family: var(--mono); font-size: 10px; letter-spacing: 0.12em;
+    color: #3b4451;
+    border-top: 1px solid rgba(255,255,255,0.05);
+    background: linear-gradient(0deg, rgba(8,10,15,0.96), rgba(8,10,15,0.6));
+    backdrop-filter: blur(8px);
+}
+footer .f-r { color: #2f3846; }
+@media (max-width: 560px) {
+    header { padding: 14px 16px; }
+    main { padding: 18px 16px 90px; }
+    #grid { grid-template-columns: 1fr; }
+    h1 { font-size: 17px; letter-spacing: .24em; }
+    footer { padding: 8px 16px; }
+}
+</style>
+</head>
+<body>
+<header>
+    <div class="h-left">
+        <h1>MINIONS</h1>
+        <span class="h-sub">hermes delegation · live</span>
+    </div>
+    <div class="h-right">
+        <span class="live-wrap" id="live"><span class="live-dot"></span><span id="live-t">LIVE</span></span>
+        <span class="count zero" id="count">0</span>
+        <a class="back" href="/">← DASHBOARD</a>
+    </div>
+</header>
+
+<main>
+    <div id="grid"></div>
+    <div id="empty">
+        <div class="empty-glyph">◍</div>
+        <div class="empty-t">No minions working — all quiet.</div>
+        <div class="empty-s">waiting for the next delegation</div>
+    </div>
+</main>
+
+<footer>
+    <span id="src">src ~/.hermes/cache/delegation/live</span>
+    <span class="f-r"><span id="tick">refresh 3s</span></span>
+</footer>
+
+<script>
+const gridEl = document.getElementById('grid');
+const emptyEl = document.getElementById('empty');
+const countEl = document.getElementById('count');
+const liveEl = document.getElementById('live');
+const liveT = document.getElementById('live-t');
+const tickEl = document.getElementById('tick');
+const cards = new Map();
+const refs = new Map();
+let awaitingFirst = true;
+
+function fmtElapsed(sec) {
+    sec = Math.max(0, Math.floor(sec || 0));
+    if (sec < 60) return sec + 's';
+    const m = Math.floor(sec / 60), s = sec % 60;
+    if (m < 60) return m + 'm ' + String(s).padStart(2, '0') + 's';
+    const h = Math.floor(m / 60);
+    return h + 'h ' + String(m % 60).padStart(2, '0') + 'm';
+}
+
+function sparkHTML(spark, ac) {
+    const n = 12, W = 64, H = 16, gap = 1.6, bw = (W - gap * (n - 1)) / n;
+    const max = Math.max(1, ...spark);
+    let out = '';
+    for (let i = 0; i < n; i++) {
+        const v = spark[i] || 0;
+        const h = v ? Math.max(2.2, (H - 2) * (v / max)) : 1.4;
+        const x = i * (bw + gap);
+        const hi = (v === max && v > 0 && i >= n - 4) ? ' class="hi"' : '';
+        out += '<rect' + hi + ' x="' + x.toFixed(2) + '" y="' + (H - h).toFixed(2) +
+               '" width="' + bw.toFixed(2) + '" height="' + h.toFixed(2) + '" rx="0.8"></rect>';
+    }
+    return out;
+}
+
+function makeCard(m) {
+    const el = document.createElement('article');
+    el.className = 'mcard enter';
+    el.dataset.status = m.status;
+    el.innerHTML =
+        '<div class="mtop">' +
+            '<span class="chip"><i class="d"></i><span class="chip-t"></span></span>' +
+            '<span class="mid"></span>' +
+            '<span class="elapsed"></span>' +
+        '</div>' +
+        '<div class="goal"></div>' +
+        '<div class="summary"><span class="caret">▸</span><span class="sum-t"></span></div>' +
+        '<div class="prow">' +
+            '<span class="pct"></span>' +
+            '<div class="pbar"><div class="pbar-fill"></div></div>' +
+            '<span class="stp"></span>' +
+        '</div>' +
+        '<div class="mfoot"><span class="toolchip"></span>' +
+            '<svg class="spark" viewBox="0 0 64 16" preserveAspectRatio="none"></svg>' +
+        '</div>';
+    const ref = {
+        el: el,
+        chipT: el.querySelector('.chip-t'),
+        mid: el.querySelector('.mid'),
+        elapsed: el.querySelector('.elapsed'),
+        goal: el.querySelector('.goal'),
+        sum: el.querySelector('.sum-t'),
+        pct: el.querySelector('.pct'),
+        fill: el.querySelector('.pbar-fill'),
+        stp: el.querySelector('.stp'),
+        tool: el.querySelector('.toolchip'),
+        spark: el.querySelector('.spark')
+    };
+    refs.set(m.id, ref);
+    gridEl.appendChild(el);
+    setTimeout(() => el.classList.remove('enter'), 520);
+    return ref;
+}
+
+function updateCard(ref, m) {
+    const ac = m.status === 'ERROR' ? '#ea4335'
+             : m.status === 'VERIFYING' ? '#f9ab00'
+             : m.status === 'DONE' ? '#14b8a6' : '#34a853';
+    ref.el.dataset.status = m.status;
+    ref.chipT.textContent = m.status;
+    ref.mid.textContent = m.id;
+    ref.elapsed.textContent = m.status === 'DONE' ? 'took ' + fmtElapsed(m.elapsed) : fmtElapsed(m.elapsed);
+    ref.goal.textContent = m.goal || '(no goal)';
+    ref.goal.title = m.goal || '';
+    ref.sum.textContent = m.summary || 'working';
+    ref.pct.textContent = m.percent + '%';
+    ref.fill.style.width = Math.max(2, Math.min(100, m.percent)) + '%';
+    ref.stp.textContent = m.steps_total ? (m.tools + '/' + (m.steps_total * 3) + ' actions')
+                                        : (m.steps + ' steps');
+    ref.tool.textContent = m.last_action || 'think';
+    ref.spark.innerHTML = sparkHTML(m.spark || new Array(12).fill(0), ac);
+}
+
+function render(list) {
+    const seen = new Set();
+    list.forEach((m, i) => {
+        seen.add(m.id);
+        let ref = refs.get(m.id);
+        if (!ref) ref = makeCard(m);
+        updateCard(ref, m);
+        // keep newest-first order without tearing the DOM down
+        if (gridEl.children[i] !== ref.el) {
+            gridEl.insertBefore(ref.el, gridEl.children[i] || null);
+        }
+    });
+    refs.forEach((ref, id) => {
+        if (!seen.has(id)) {
+            refs.delete(id);
+            ref.el.classList.add('leave');
+            setTimeout(() => ref.el.remove(), 320);
+        }
+    });
+    countEl.textContent = list.length;
+    countEl.classList.toggle('zero', list.length === 0);
+    emptyEl.classList.toggle('show', list.length === 0 && !awaitingFirst);
+    liveEl.classList.remove('off');
+    liveT.textContent = 'LIVE';
+}
+
+function setOffline() {
+    liveEl.classList.add('off');
+    liveT.textContent = 'NO LINK';
+}
+
+async function poll() {
+    if (document.hidden) return;
+    try {
+        const r = await fetch('/api/minions', { cache: 'no-store' });
+        if (!r.ok) throw new Error('http ' + r.status);
+        const list = await r.json();
+        render(Array.isArray(list) ? list : []);
+    } catch (e) {
+        setOffline();
+    } finally {
+        awaitingFirst = false;
+        emptyEl.classList.toggle('show', refs.size === 0 && !awaitingFirst);
+        tickEl.textContent = 'updated ' + new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    }
+}
+
+poll();
+setInterval(poll, 3000);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) poll(); });
+</script>
+</body>
+</html>'''
+
+
 def _page():
     """Return the dashboard HTML with the configured node/model/mem values injected.
     No-op when the env defaults are used, so the public repo stays generic and
@@ -2791,6 +3222,400 @@ def api_llmstudio():
 @app.route('/api/opencodego')
 def api_opencodego():
     return jsonify(_go_cache or {})
+
+# ============================================================================
+# MINIONS — live Hermes subagent panel
+# Reads the delegation live-transcript dir (plain-text or JSON transcripts) and
+# exposes /api/minions + /minions. Nothing here touches the existing pollers.
+# ============================================================================
+DELEG_LIVE_DIR = os.getenv(
+    "DASHSPLASH_DELEGATION_LIVE_DIR",
+    "/home/ubuntu/.hermes/cache/delegation/live",
+)
+MINION_LIVE_WINDOW = float(os.getenv("DASHSPLASH_MINION_LIVE_WINDOW", "120"))
+
+_MINION_LINE_RE = re.compile(r"^(\d{2}):(\d{2}):(\d{2})\s+([a-z_]+)\s*\|\s?(.*)$")
+_MINION_STEP_RE = re.compile(r"(?:^|[\s(])(\d{1,2})[).]\s+\S")
+
+# Secrets that may leak from a child's transcript (config dumps, curl headers).
+# Everything served by /api/minions goes through _minion_scrub().
+_SECRET_PATTERNS = [
+    (re.compile(r"oc_sk_[A-Za-z0-9_\-]+"), "[redacted]"),
+    (re.compile(r"sk-ant-[A-Za-z0-9_\-]{16,}"), "[redacted]"),
+    (re.compile(r"sk-[A-Za-z0-9]{20,}"), "[redacted]"),
+    (re.compile(r"ghp_[A-Za-z0-9]{20,}"), "[redacted]"),
+    (re.compile(r"github_pat_[A-Za-z0-9_]{20,}"), "[redacted]"),
+    (re.compile(r"xox[baprs]-[A-Za-z0-9\-]{10,}"), "[redacted]"),
+    (re.compile(r"eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}"), "[redacted]"),
+]
+_SECRET_BEARER = re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._\-]{16,}")
+
+
+def _minion_scrub(value):
+    """Strip credentials from any string before it leaves the process."""
+    if value is None:
+        return ""
+    s = str(value)
+    for pat, repl in _SECRET_PATTERNS:
+        s = pat.sub(repl, s)
+    s = _SECRET_BEARER.sub(lambda m: m.group(1) + "[redacted]", s)
+    return s
+
+
+def _minion_role(t):
+    return {
+        "tool": "tool", "assistant": "assistant", "think": "think",
+        "tool_result": "result", "result": "result", "error": "error",
+        "summary": "assistant", "system": "system", "task": "start",
+        "user": "user", "start": "start", "final": "final",
+    }.get(t or "", t or "")
+
+
+def _minion_read_log(path):
+    """Parse one task-<N>.log. Supports the JSON transcript shape and the
+    plain-text append-only shape. Returns None when unreadable/empty."""
+    try:
+        st = os.stat(path)
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            raw = fh.read()
+    except OSError:
+        return None
+    body = raw.strip()
+    if not body:
+        return None
+
+    parsed = None
+    if body.startswith("{"):
+        try:
+            obj = json.loads(body)
+            if isinstance(obj, dict) and isinstance(obj.get("transcript"), list):
+                blocks = []
+                for b in obj["transcript"]:
+                    if not isinstance(b, dict):
+                        continue
+                    content = b.get("content")
+                    if isinstance(content, (dict, list)):
+                        content = json.dumps(content)[:400]
+                    blocks.append({
+                        "role": _minion_role(b.get("type")),
+                        "text": str(content if content is not None else "")[:600],
+                        "tool": b.get("tool"),
+                        "ts": None,
+                    })
+                parsed = {
+                    "goal": str(obj.get("goal") or ""),
+                    "started": None,
+                    "blocks": blocks,
+                    "done": obj.get("result") is not None,
+                    "error": None,
+                }
+        except (ValueError, TypeError):
+            parsed = None
+
+    if parsed is None:
+        goal, started, blocks = "", None, []
+        for line in body.splitlines():
+            m = _MINION_LINE_RE.match(line)
+            if m:
+                hh, mm, ss, role, txt = m.groups()
+                blocks.append({
+                    "role": role,
+                    "text": txt,
+                    "tool": None,
+                    "ts": int(hh) * 3600 + int(mm) * 60 + int(ss),
+                })
+                continue
+            if not goal and line.startswith("goal:"):
+                goal = line[5:].strip()
+            elif not started and line.startswith("started:"):
+                started = line[8:].strip()
+        if not blocks and not goal:
+            return None
+        # done / error from the trailing "final" line, e.g. "final | end status=ok"
+        tail = " ".join(b["text"] for b in blocks[-3:] if b["role"] in ("final", "error"))
+        done = bool(re.search(r"status=(ok|completed|done|success)", tail, re.I))
+        error = None
+        if blocks and blocks[-1]["role"] == "error":
+            error = blocks[-1]["text"]
+        m = re.search(r"status=([a-z_]+)", tail, re.I)
+        if m and m.group(1).lower() in ("failed", "error", "interrupted", "cancelled"):
+            error = error or f"status={m.group(1)}"
+        parsed = {
+            "goal": goal, "started": started, "blocks": blocks,
+            "done": done or (bool(blocks) and blocks[-1]["role"] == "final" and not error),
+            "error": error,
+        }
+
+    parsed["mtime"] = st.st_mtime
+    parsed["size"] = st.st_size
+    # normalise timestamps to epoch seconds (seconds-of-day -> today, with a
+    # midnight guard so a log started at 23:58 still reads correctly at 00:05).
+    now = time.time()
+    today0 = now - (now % 86400) + time.timezone  # local midnight, cheap approx
+    for b in parsed["blocks"]:
+        if b["ts"] is not None and b["ts"] < 86400:
+            b["ts"] = today0 + b["ts"]
+            if b["ts"] > now + 120:
+                b["ts"] -= 86400
+    return parsed
+
+
+_MINION_CACHE = {}
+
+
+def _minion_log(path):
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    key = (st.st_mtime_ns, st.st_size)
+    hit = _MINION_CACHE.get(path)
+    if hit and hit[0] == key:
+        return hit[1]
+    data = _minion_read_log(path)
+    _MINION_CACHE[path] = (key, data)
+    return data
+
+
+_TERMINAL_VERBS = [
+    (r"git push", "Pushing to git"),
+    (r"git commit", "Committing changes"),
+    (r"git add", "Staging files"),
+    (r"git (status|diff|log|show)", "Checking git state"),
+    (r"localhost:8081|127\.0\.0\.1:8081|/api/", "Probing the dashboard API"),
+    (r"curl", "Probing HTTP endpoints"),
+    (r"systemctl|service ", "Restarting the service"),
+    (r"pytest|unittest|npm test|go test", "Running the test suite"),
+    (r"\bpip install|\bbrew install|apt-get", "Installing dependencies"),
+    (r"\bpython[0-9.]*\b", "Running a Python script"),
+    (r"\b(sed|awk)\b", "Reading source slices"),
+    (r"\b(grep|rg)\b", "Grepping the codebase"),
+    (r"\b(find|ls)\b", "Listing files"),
+    (r"\bcat\b", "Reading a file"),
+    (r"\b(wc|du|df)\b", "Measuring files"),
+    (r"\bmkdir|\bcp\b|\bmv\b", "Moving files around"),
+    (r"\bssh|scp|rsync", "Reaching another host"),
+    (r"\bdocker|kubectl", "Touching containers"),
+]
+_TOOL_LABELS = {
+    "read_file": "Reading", "write_file": "Writing", "patch": "Editing",
+    "search_files": "Searching code", "web_search": "Searching the web",
+    "web_extract": "Fetching a page", "skill_view": "Loading a skill",
+    "todo_list": "Updating the plan", "delegate_task": "Spawning a child",
+    "execute_code": "Running Python", "browser_exec": "Driving the browser",
+    "vision_analyze": "Looking at an image", "terminal": "Running",
+    "process_manage": "Checking a process", "skill_manage": "Saving a skill",
+}
+
+
+def _minion_from_tool(text, tool=None):
+    """Turn '-> terminal(git status --short)' into 'Checking git state'."""
+    raw = (text or "").strip()
+    arg = ""
+    name = (tool or "").strip()
+    m = re.match(r"^->\s*([a-z_]+)\((.*)\)\s*$", raw, re.S)
+    if m:
+        name = m.group(1) or name
+        arg = m.group(2)
+    elif raw.startswith("->"):
+        arg = raw[2:].strip()
+    arg = arg.strip()
+    if name == "terminal" or name == "":
+        low = raw.lower()
+        for pat, label in _TERMINAL_VERBS:
+            if re.search(pat, low):
+                return label
+        first = arg.split()[0] if arg.split() else "command"
+        if first.strip("'\"") in ("echo", "printf", "cd", "true", "false", "sleep",
+                                   "source", "export", "set", "test", "[", "fi",
+                                   "done", "if", "for", "while", "then", "do"):
+            return "Running a shell command"
+        return f"Running {first}"[:48]
+    label = _TOOL_LABELS.get(name)
+    if not label:
+        return name.replace("_", " ").capitalize()
+    if name in ("read_file", "write_file", "patch", "seek") and arg:
+        base = arg.split("(")[0].replace("'", " ").replace('"', " ").strip()
+        base = os.path.basename(base.split()[0]) if base.split() else ""
+        if base:
+            return f"{label} {base}"[:48]
+    if name in ("search_files", "web_search") and arg:
+        return f"{label}: {arg.split(',')[0][:34]}"
+    return label
+
+
+def _minion_words(text, limit=9):
+    """First `limit` words of a prose block, markdown stripped."""
+    s = re.sub(r"[`*_#>\[\]]", "", text or "")
+    s = re.sub(r"\s+", " ", s).strip()
+    if not s:
+        return ""
+    words = s.split(" ")
+    out = " ".join(words[:limit])
+    if len(words) > limit:
+        out += "…"
+    return out[:110]
+
+
+_VERIFY_RE = re.compile(
+    r"curl\s+-s|curl\s+-I|systemctl status|journalctl|pytest|\bjest\b|\bverify|"
+    r"\bassert\b|diff\s+-|<\(|grep -c|json\.load|json\.tool",
+    re.I,
+)
+
+
+def _minion_goal_steps(goal):
+    nums = {int(n) for n in _MINION_STEP_RE.findall(goal or "") if 1 <= int(n) <= 20}
+    return max(nums) if nums else 0
+
+
+def _minion_build(deleg_id, task_idx, data, manifest):
+    blocks = data["blocks"] or []
+    now = time.time()
+
+    # --- current action -----------------------------------------------------
+    last_tool = None
+    last_tool_i = -1
+    for i, b in enumerate(blocks):
+        if b["role"] == "tool":
+            last_tool, last_tool_i = b, i
+    summary, tool_name = "", ""
+    if last_tool is not None:
+        summary = _minion_from_tool(last_tool["text"], last_tool.get("tool"))
+        tool_name = re.sub(r"^->\s*([a-z_]+)\(.*", r"\1", last_tool["text"].strip()) or "tool"
+    generic = summary in ("Running a shell command", "Running terminal command", "Running sh", "")
+    if not summary or generic:
+        # a truncated shell blob says nothing useful -> fall back to the last
+        # sentence the agent actually wrote about what it is doing
+        for b in list(reversed(blocks))[-8:]:
+            if b["role"] in ("assistant", "think"):
+                prose = _minion_words(b["text"], 8)
+                if len(prose) > 12:
+                    summary = prose
+                    break
+    if not summary:
+        summary = "Warming up"
+    if not tool_name:
+        tool_name = "think"
+
+    # --- status -------------------------------------------------------------
+    manifest_status = (manifest.get("status") or "").lower()
+    last_role = blocks[-1]["role"] if blocks else ""
+    errored = bool(data.get("error")) or manifest_status in ("failed", "error", "interrupted", "cancelled")
+    if errored:
+        status = "ERROR"
+    elif data.get("done") or manifest_status in ("completed", "done", "success"):
+        status = "DONE"
+    elif last_tool is not None and last_tool_i == len(blocks) - 1 and _VERIFY_RE.search(last_tool["text"] or ""):
+        status = "VERIFYING"
+    elif last_role in ("result",) and last_tool is not None and _VERIFY_RE.search(last_tool["text"] or ""):
+        status = "VERIFYING"
+    else:
+        status = "WORKING"
+
+    # --- progress -----------------------------------------------------------
+    tools_done = sum(1 for b in blocks if b["role"] == "tool")
+    total_steps = _minion_goal_steps(data.get("goal") or "")
+    if status == "DONE":
+        percent = 100
+    elif total_steps >= 2:
+        done_steps = min(total_steps, tools_done / 3.0)
+        percent = int(max(3, min(95, 100.0 * done_steps / total_steps)))
+    else:
+        percent = int(max(4, min(95, tools_done * 12)))
+    if status == "ERROR":
+        percent = max(percent, 5)
+
+    # --- timing -------------------------------------------------------------
+    stamps = [b["ts"] for b in blocks if b.get("ts")]
+    started_epoch = stamps[0] if stamps else data["mtime"]
+    started = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(started_epoch))
+    elapsed = max(0, int((now if status in ("WORKING", "VERIFYING") else data["mtime"]) - started_epoch))
+
+    # --- sparkline: steps per 10s bucket over the last 2 minutes -------------
+    spark = [0] * 12
+    for b in blocks:
+        ts = b.get("ts")
+        if not ts or b["role"] in ("user", "start", "system"):
+            continue
+        age = now - ts
+        if 0 <= age < 120:
+            spark[11 - int(age // 10)] += 1
+
+    return {
+        "id": f"{deleg_id}#{task_idx}",
+        "goal": _minion_scrub((data.get("goal") or "")[:400]),
+        "summary": _minion_scrub(summary),
+        "percent": percent,
+        "status": status,
+        "started": started,
+        "elapsed": elapsed,
+        "last_action": _minion_scrub(tool_name),
+        "steps": len(blocks),
+        "tools": tools_done,
+        "spark": spark,
+        "steps_total": total_steps,
+    }
+
+
+def scan_minions():
+    """Every live delegation task, newest activity first."""
+    out = []
+    try:
+        entries = os.listdir(DELEG_LIVE_DIR)
+    except OSError:
+        return out
+    now = time.time()
+    for deleg_id in entries:
+        ddir = os.path.join(DELEG_LIVE_DIR, deleg_id)
+        if not os.path.isdir(ddir):
+            continue
+        manifest = {}
+        try:
+            with open(os.path.join(ddir, "manifest.json"), "r", encoding="utf-8") as fh:
+                manifest = json.load(fh) or {}
+        except (OSError, ValueError):
+            manifest = {}
+        tasks_meta = {t.get("index"): t for t in (manifest.get("tasks") or []) if isinstance(t, dict)}
+        try:
+            names = os.listdir(ddir)
+        except OSError:
+            continue
+        for name in names:
+            m = re.match(r"^task-(\d+)\.log$", name)
+            if not m:
+                continue
+            idx = int(m.group(1))
+            path = os.path.join(ddir, name)
+            try:
+                if now - os.stat(path).st_mtime > MINION_LIVE_WINDOW:
+                    continue
+            except OSError:
+                continue
+            data = _minion_log(path)
+            if not data:
+                continue
+            meta = dict(manifest)
+            meta.update({k: v for k, v in (tasks_meta.get(idx) or {}).items() if v})
+            item = _minion_build(deleg_id, idx, data, meta)
+            item["mtime"] = int(data["mtime"])
+            out.append(item)
+    out.sort(key=lambda x: x.get("mtime", 0), reverse=True)
+    return out
+
+
+@app.route("/api/minions")
+def api_minions():
+    try:
+        return jsonify(scan_minions())
+    except Exception as e:  # never 500 the panel
+        print(f"[MINIONS] scan failed: {e}", flush=True)
+        return jsonify([])
+
+
+@app.route("/minions")
+def minions_page():
+    return MINIONS_HTML
 
 @app.route('/api/splash_status')
 def api_splash_status():
