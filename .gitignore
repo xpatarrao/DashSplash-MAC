@@ -21,3 +21,6 @@ nohup.out
 .env
 *.bak
 *.bak2
+
+# Runtime data (energy history store, settings, uploads, backgrounds)
+data/

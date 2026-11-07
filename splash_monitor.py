@@ -4,6 +4,8 @@ import requests
 import threading
 import re
 import sys
+import json
+import math
 from flask import Flask, render_template_string, jsonify, request
 from urllib.parse import urlparse
 
@@ -14,6 +16,8 @@ app = Flask(__name__)
 SPLASH_URL        = os.getenv("DASHSPLASH_SPLASH_URL", "http://127.0.0.1:8000/metrics")
 MACMON_URL        = os.getenv("DASHSPLASH_MACMON_URL", "http://127.0.0.1:9090/json")
 OLLAMA_URL        = os.getenv("DASHSPLASH_OLLAMA_URL", "http://127.0.0.1:11434/api/ps")
+LLMSTUDIO_URL     = os.getenv("DASHSPLASH_LLMSTUDIO_URL", "http://192.168.1.x:1234")
+OPENCODE_GO_USAGE_URL = os.getenv("DASHSPLASH_OPENCODE_GO_URL", "https://opencode.ai/zen/go/v1/usage")
 MODEL_NAME        = os.getenv("DASHSPLASH_MODEL",      "Qwen3.8-27B-4bit")
 GPU_TDP           = float(os.getenv("DASHSPLASH_GPU_TDP",  "100"))    # GPU TDP in W
 MEMORY_TOTAL_GB   = float(os.getenv("DASHSPLASH_MEM_GB",  "54.5"))    # unified memory in GB
@@ -30,9 +34,281 @@ def _base(url):
 SPLASH_BASE = _base(SPLASH_URL)   # http://192.168.1.x:8000
 OLLAMA_BASE = _base(OLLAMA_URL)   # http://192.168.1.x:11434
 
+# Splash live status (small JSON: ready/thermal/reasoning_switch/
+# scheduler counts/active_requests). Feeds the "thinking" indicator.
+SPLASH_STATUS_URL = os.getenv("DASHSPLASH_STATUS_URL", f"{SPLASH_BASE}/status")
+
 metrics_cache = {}
 macmon_cache = {}
 ollama_cache = {}
+llmstudio_cache = {}
+splash_status_cache = {}
+
+# Estimate resident RAM (bytes) for a loaded model from its id + metadata.
+# macmon/LM Studio expose no per-model RSS, so we estimate from the declared
+# weights (params x bits) — this is the model's weight footprint, NOT the full
+# process RSS (which adds KV-cache + runtime and is larger). Good enough to give
+# LLM Studio its own segment in the memory bar.
+_QUANT_BITS = {
+    "4bit": 4, "8bit": 8, "16bit": 16, "bfloat16": 16, "float16": 16,
+    "q4_k_m": 4, "q4_k_s": 4, "q4_0": 4, "q5_k_m": 5, "q8_0": 8,
+    "af_4": 4, "af_16": 16, "mlx_4bit": 4, "mlx_8bit": 8, "none": 16,
+}
+
+def _model_params(id_str, arch=None, quant=None):
+    """Best-effort total params (int) from a model id. Returns None if unparseable.
+    Uses active params (A3B / MoE 'a' count) for MoE arches, else total."""
+    s = (id_str or "").lower()
+    arch = (arch or "").lower()
+    m = re.search(r"(\d+(?:\.\d+)?)(?:[_.-]?(?:b|B)\b|b(?=[a-z0-9]))", s)
+    total = None
+    for mm in re.finditer(r"(\d+(?:\.\d+)?)[_.\- ]?(?:b|billion|B)\b", s):
+        total = float(mm.group(1)) * 1e9
+    if total is None:
+        m2 = re.search(r"-(\d+(?:\.\d+)?)b", s)
+        if m2:
+            total = float(m2.group(1)) * 1e9
+    # MoE active params: e.g. "35b-a3b" -> active 3B; "35b a3b"
+    if total and ("moe" in arch or "a" in s):
+        ma = re.search(r"a\s?(\d+(?:\.\d+)?)\s?b", s)
+        if ma:
+            return float(ma.group(1)) * 1e9
+    return total
+
+def _est_model_ram_bytes(mid, meta=None):
+    """Estimated resident RAM (bytes) for one model. 0 if unknown.
+    Uses TOTAL params (all MoE experts are resident in RAM even if only a
+    subset is active), x declared quant bits."""
+    meta = meta or {}
+    s = (mid or "").lower()
+    arch = (meta.get("arch") or "").lower()
+    total = None
+    # Take the LARGEST "N b" marker: for MoE the total (35b) exceeds the active
+    # (a3b=3b), and only the total is resident in RAM. Max avoids "a3b" clobbering "35b".
+    for mm in re.finditer(r"(\d+(?:\.\d+)?)[_.\- ]?(?:b|billion|B)\b", s):
+        val = float(mm.group(1)) * 1e9
+        total = val if total is None else max(total, val)
+    if not total:
+        total = _model_params(mid, arch, meta.get("quantization"))
+    if not total:
+        return 0
+    q = (meta.get("quantization") or "").lower()
+    bits = None
+    for key, b in _QUANT_BITS.items():
+        if key in q:
+            bits = b
+            break
+    if bits is None:
+        bits = 4  # most LM Studio models here are 4-bit
+    return int(total * bits / 8)
+_llmstudio_last_bench = 0
+llmstudio_ids = {}
+# OpenCode Go delegation-quota cache (percent used per window; no token counts).
+_go_last_fetch = 0
+_go_cache = {}
+
+# ─── Energy history store (persisted power samples) ─────────────────────────
+# Format: JSON Lines, one object per poll at data/energy/history.jsonl
+#   {"t": <epoch seconds>, "sys": <W>, "gpu": <W>, "cpu": <W>}
+# The update loop appends one row per poll (~5 s). Rows older than 24 h are
+# thinned to one averaged point per minute and rows older than 90 days are
+# dropped, so the file stays bounded (~150k lines worst case) and every range
+# query is served from the in-memory mirror of that store.
+# NOTE: this is a separate store from the in-memory `history` dict below,
+# which only covers the running session and is NOT persisted.
+_ENERGY_DIR = os.getenv(
+    "DASHSPLASH_ENERGY_DIR",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "energy"))
+_ENERGY_FILE = os.path.join(_ENERGY_DIR, "history.jsonl")
+_ENERGY_LOCK = threading.Lock()
+_ENERGY_SAMPLES = None          # [(t, sys_w, gpu_w, cpu_w)] ascending, lazy-loaded
+_ENERGY_APPENDS = 0
+_ENERGY_RETENTION_S = 90 * 86400   # keep 90 days
+_ENERGY_FULL_RES_S = 24 * 3600     # full resolution for the last day
+_ENERGY_THIN_S = 60                # bucket size (s) for older rows
+_ENERGY_MAX_ROWS = 400000          # hard ceiling before a forced thinning
+ENERGY_RANGES = {
+    "1h": 3600,
+    "24h": 86400,
+    "7d": 7 * 86400,
+    "30d": 30 * 86400,
+    "90d": 90 * 86400,
+}
+
+
+def _energy_load():
+    """Load history.jsonl into the in-memory list (idempotent, caller locks)."""
+    global _ENERGY_SAMPLES
+    if _ENERGY_SAMPLES is not None:
+        return _ENERGY_SAMPLES
+    rows = []
+    try:
+        os.makedirs(_ENERGY_DIR, exist_ok=True)
+        if os.path.exists(_ENERGY_FILE):
+            with open(_ENERGY_FILE, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        d = json.loads(line)
+                        rows.append((float(d["t"]), float(d.get("sys", 0) or 0),
+                                     float(d.get("gpu", 0) or 0), float(d.get("cpu", 0) or 0)))
+                    except Exception:
+                        continue        # skip a torn/corrupt line, keep the rest
+    except Exception as e:
+        print(f"[ENERGY] load failed ({_ENERGY_FILE}): {e}", flush=True)
+    rows.sort(key=lambda r: r[0])
+    _ENERGY_SAMPLES = rows
+    return rows
+
+
+def _energy_rewrite(rows):
+    """Atomically replace history.jsonl with `rows` (caller holds the lock)."""
+    try:
+        os.makedirs(_ENERGY_DIR, exist_ok=True)
+        tmp = _ENERGY_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            for t, sysw, gpuw, cpuw in rows:
+                f.write(json.dumps({"t": round(t, 1), "sys": round(sysw, 2),
+                                    "gpu": round(gpuw, 2), "cpu": round(cpuw, 2)}) + "\n")
+        os.replace(tmp, _ENERGY_FILE)
+    except Exception as e:
+        print(f"[ENERGY] rewrite failed ({_ENERGY_FILE}): {e}", flush=True)
+
+
+def _energy_thin(rows):
+    """Drop >90d rows and merge the 24h..90d tail into 1-minute averages."""
+    if not rows:
+        return rows
+    now = rows[-1][0]
+    cut_full = now - _ENERGY_FULL_RES_S
+    cut_ret = now - _ENERGY_RETENTION_S
+    out = []
+    bucket = None   # [bucket_start, sys_sum, gpu_sum, cpu_sum, n]
+
+    def flush():
+        nonlocal bucket
+        if bucket:
+            n = bucket[4]
+            out.append((bucket[0], bucket[1] / n, bucket[2] / n, bucket[3] / n))
+        bucket = None
+
+    for t, sysw, gpuw, cpuw in rows:
+        if t < cut_ret:
+            continue
+        if t >= cut_full:
+            flush()
+            out.append((t, sysw, gpuw, cpuw))
+            continue
+        k = int(t // _ENERGY_THIN_S) * _ENERGY_THIN_S
+        if bucket is None or bucket[0] != k:
+            flush()
+            bucket = [k, sysw, gpuw, cpuw, 1]
+        else:
+            bucket[1] += sysw
+            bucket[2] += gpuw
+            bucket[3] += cpuw
+            bucket[4] += 1
+    flush()
+    return out
+
+
+def _energy_needs_thin(rows):
+    """True when the store actually needs pruning/merging (cheap-ish check)."""
+    if not rows:
+        return False
+    now = rows[-1][0]
+    if rows[0][0] < now - _ENERGY_RETENTION_S:
+        return True                      # something is older than 90 days
+    cut_full = now - _ENERGY_FULL_RES_S
+    old = sum(1 for r in rows if r[0] < cut_full)
+    max_old = (_ENERGY_RETENTION_S - _ENERGY_FULL_RES_S) // _ENERGY_THIN_S + 2
+    return old > max_old * 1.2
+
+
+def energy_record(now, macmon):
+    """Append one power sample. Called once per poll from record_history().
+
+    Skips the poll when macmon returned nothing (macmon down): writing zeros
+    would silently invent consumption history.
+    """
+    global _ENERGY_APPENDS
+    if not isinstance(macmon, dict) or "sys_power" not in macmon:
+        return
+    try:
+        row = (float(now),
+               float(macmon.get("sys_power") or 0),
+               float(macmon.get("gpu_power") or 0),
+               float(macmon.get("cpu_power") or 0))
+    except Exception:
+        return
+    if row[0] <= 0:
+        return
+    with _ENERGY_LOCK:
+        rows = _energy_load()
+        # never store two samples inside the same second (restart overlap)
+        if rows and abs(row[0] - rows[-1][0]) < 1.0:
+            return
+        rows.append(row)
+        _ENERGY_APPENDS += 1
+        if (_ENERGY_APPENDS % 360 == 0 or len(rows) > _ENERGY_MAX_ROWS) and _energy_needs_thin(rows):
+            thinned = _energy_thin(rows)
+            rows[:] = thinned
+            _energy_rewrite(rows)
+            return          # the rewrite already persisted this sample
+        try:
+            os.makedirs(_ENERGY_DIR, exist_ok=True)
+            with open(_ENERGY_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps({"t": round(row[0], 1), "sys": round(row[1], 2),
+                                    "gpu": round(row[2], 2), "cpu": round(row[3], 2)}) + "\n")
+        except Exception as e:
+            print(f"[ENERGY] append failed ({_ENERGY_FILE}): {e}", flush=True)
+
+
+def _energy_query(range_key, max_points=500):
+    """Downsampled points + integrated kWh/cost for one range.
+
+    Returns {"range", "start", "end", "samples", "points", "kwh", "cost"} where
+    points is [{t: epoch_s, watts, gpu_watts}] with at most ~max_points entries.
+    """
+    span = ENERGY_RANGES.get(range_key)
+    if not span:
+        return None
+    with _ENERGY_LOCK:
+        rows = list(_energy_load())
+    if not rows:
+        return {"range": range_key, "start": None, "end": None, "samples": 0,
+                "points": [], "kwh": 0.0, "cost": 0.0}
+    end = rows[-1][0]
+    start = end - span
+    win = [r for r in rows if r[0] >= start]
+    if not win:
+        return {"range": range_key, "start": start, "end": end, "samples": 0,
+                "points": [], "kwh": 0.0, "cost": 0.0}
+    # Trapezoid integration on the raw rows of the window (system watts).
+    kwh = 0.0
+    for i in range(1, len(win)):
+        dt_h = (win[i][0] - win[i - 1][0]) / 3600.0
+        if dt_h <= 0:
+            continue
+        kwh += ((win[i][1] + win[i - 1][1]) / 2.0) * dt_h / 1000.0
+    n = len(win)
+    step = max(1, int(math.ceil(n / float(max_points))))
+    pts = []
+    for i in range(0, n, step):
+        chunk = win[i:i + step]
+        m = len(chunk)
+        mid = chunk[m // 2]
+        pts.append({
+            "t": round(mid[0], 1),
+            "watts": round(sum(c[1] for c in chunk) / m, 1),
+            "gpu_watts": round(sum(c[2] for c in chunk) / m, 1),
+        })
+    return {"range": range_key, "start": start, "end": end, "samples": n,
+            "points": pts, "kwh": round(kwh, 4), "cost": round(kwh * KWH_PRICE, 4)}
+
+
 history = {
     'memory_used': [], 'memory_limit': [],
     'decode_tps': [], 'prefill_tps': [],
@@ -42,6 +318,138 @@ history = {
     'gpu_util': [], 'gpu_freq': [],
     'fan_rpm': [],
 }
+
+def fetch_llmstudio():
+    """LLM Studio is OpenAI-compatible but exposes no live T/s. We probe it
+    (throttled, bench every 120s) and accumulate completion tokens per model.
+
+    We read the model list from /api/v0/models (LM Studio native) because it
+    carries `state` ("loaded"/"not-loaded"), so we only surface models that
+    are actually resident in memory. If that endpoint is absent, we fall back
+    to /v1/models and treat every listed model as loaded.
+    """
+    global _llmstudio_last_bench
+    now = time.time()
+    base = LLMSTUDIO_URL.rstrip('/')
+    ids = []
+    loaded = []          # list of (mid, meta_dict) for state=='loaded'
+    try:
+        r = requests.get(f"{base}/api/v0/models", timeout=6)
+        for m in r.json().get("data", []):
+            if not isinstance(m, dict):
+                continue
+            mid = m.get("id")
+            if not mid:
+                continue
+            ids.append(mid)
+            if m.get("state") == "loaded":
+                loaded.append((mid, {"arch": m.get("arch"), "quantization": m.get("quantization")}))
+    except Exception:
+        ids = []
+    if not ids:
+        # fallback: OpenAI /v1/models (no state/meta) -> treat all as loaded
+        try:
+            r = requests.get(f"{base}/v1/models", timeout=6)
+            for m in r.json().get("data", []):
+                if not isinstance(m, dict) or not m.get("id"):
+                    continue
+                ids.append(m.get("id"))
+                loaded.append((m.get("id"), {"arch": m.get("arch"), "quantization": m.get("quantization")}))
+        except Exception:
+            return {"online": False, "count": 0, "models": [], "tps": 0, "ram_used": 0}
+        loaded = [(mid, {}) for mid in ids]
+    loaded_ids = [mid for mid, _ in loaded]
+    if now - _llmstudio_last_bench >= 120 and loaded_ids:
+        _llmstudio_last_bench = now
+        for mid in loaded_ids:
+            if mid not in llmstudio_ids:
+                llmstudio_ids[mid] = {"gen": 0, "tps": 0}
+            try:
+                t0 = time.time()
+                rr = requests.post(
+                    f"{base}/v1/chat/completions",
+                    json={"model": mid, "messages": [{"role": "user", "content": "di hola"}],
+                          "max_tokens": 8, "stream": False}, timeout=60)
+                u = (rr.json().get("usage") or {}).get("completion_tokens", 0)
+                llmstudio_ids[mid]["gen"] = llmstudio_ids[mid].get("gen", 0) + u
+                wall = max(time.time() - t0, 0.01)
+                if u:
+                    llmstudio_ids[mid]["tps"] = round(u / wall, 1)
+            except Exception:
+                pass
+    models = []
+    meta_by_id = {mid: meta for mid, meta in loaded}
+    ram_total = 0
+    for m in loaded_ids:
+        st = llmstudio_ids.get(m, {})
+        ram = _est_model_ram_bytes(m, meta_by_id.get(m))
+        ram_total += ram
+        models.append({"id": m, "gen": st.get("gen", 0), "tps": st.get("tps", 0), "ram": ram})
+    return {"online": True, "count": len(models),
+            "models": models,
+            "ram_used": ram_total,
+            "tps": round(sum(v.get("tps", 0) for v in llmstudio_ids.values()), 1)}
+
+
+def fetch_opencodego():
+    """OpenCode Go delegation quota.
+
+    The API exposes quota windows only (no token counters), each with
+    `status`, `percent` (fraction of the window's quota used, 0-100) and
+    `resetsAt` (ISO8601). Throttled at 120s and cached so the update loop can
+    call it every 5s without hammering the endpoint. Never raises: any failure
+    yields {'online': False, ...} and the dashboard renders a muted line.
+    """
+    global _go_last_fetch, _go_cache
+    now = time.time()
+    if _go_cache and (now - _go_last_fetch) < 120:
+        return _go_cache
+    key = (os.getenv('DASHSPLASH_OPENCODE_GO_KEY') or '').strip()
+    if not key:
+        _go_cache = {'online': False, 'reason': 'no_api_key', 'windows': {}}
+        _go_last_fetch = now
+        return _go_cache
+    try:
+        r = requests.get(
+            OPENCODE_GO_USAGE_URL,
+            headers={'Authorization': f'Bearer {key}'},
+            timeout=8)
+        if r.status_code != 200:
+            _go_cache = {'online': False, 'reason': f'http_{r.status_code}', 'windows': {}}
+            _go_last_fetch = now
+            return _go_cache
+        payload = r.json()
+        usage = payload.get('usage') if isinstance(payload, dict) else None
+        if not isinstance(usage, dict):
+            _go_cache = {'online': False, 'reason': 'bad_payload', 'windows': {}}
+            _go_last_fetch = now
+            return _go_cache
+        windows = {}
+        for name in ('rolling', 'weekly', 'monthly'):
+            w = usage.get(name)
+            if not isinstance(w, dict):
+                w = {}
+            raw = w.get('percent')
+            pct = None
+            if raw is not None:
+                try:
+                    pct = float(raw)
+                except (TypeError, ValueError):
+                    pct = None
+            windows[name] = {
+                'status': w.get('status'),
+                'percent': pct,
+                'resetsAt': w.get('resetsAt'),
+            }
+        _go_cache = {'online': True, 'windows': windows,
+                     'fetched_at': int(now), 'reason': None}
+        _go_last_fetch = now
+        return _go_cache
+    except Exception as e:
+        _go_cache = {'online': False, 'reason': str(e)[:120], 'windows': {}}
+        _go_last_fetch = now
+        return _go_cache
+
 
 def parse_splash(text):
     data = {}
@@ -140,6 +548,11 @@ def record_history(splash, macmon):
     history['gpu_util'].append((now, macmon.get('gpu_util', 0)))
     history['gpu_freq'].append((now, macmon.get('gpu_freq', 0)))
     history['fan_rpm'].append((now, macmon.get('fan_rpm', 0)))
+    # Persist the power samples for the Energy card's multi-range history.
+    try:
+        energy_record(now, macmon)
+    except Exception as _e:
+        print(f"[ENERGY] record failed: {_e}", flush=True)
     cutoff = now - 3600
     for k in history:
         history[k] = [(t, v) for t, v in history[k] if t > cutoff]
@@ -158,6 +571,43 @@ def fetch_macmon():
         return extract_macmon(r.json())
     except:
         return {}
+
+def fetch_splash_status():
+    """Live /status snapshot: ready, thermal, reasoning switch, scheduler
+    counts and the per-request list (id/phase/token counters). Falls back to
+    the last good cache on failure so the UI never flickers to empty."""
+    try:
+        r = requests.get(SPLASH_STATUS_URL, timeout=3)
+        d = r.json()
+        sched = d.get('scheduler') or {}
+        reqs = []
+        for a in (d.get('active_requests') or []):
+            if not isinstance(a, dict):
+                continue
+            reqs.append({
+                'id': a.get('id'),
+                'phase': a.get('phase') or 'decode',
+                'prompt_tokens': a.get('prompt_tokens', 0) or 0,
+                'prompt_processed': a.get('prompt_processed', 0) or 0,
+                'generated_tokens': a.get('generated_tokens', 0) or 0,
+                'max_new_tokens': a.get('max_new_tokens', 0) or 0,
+                'age_ms': int(a.get('age_ms', 0) or 0),
+            })
+        return {
+            'ok': True,
+            'ready': bool(d.get('ready', False)),
+            'thermal_state': d.get('thermal_state') or 'nominal',
+            'reasoning_switch': bool(d.get('reasoning_switch', False)),
+            'scheduler': {
+                'decoding': sched.get('decoding', 0) or 0,
+                'prefilling': sched.get('prefilling', 0) or 0,
+                'queued': sched.get('queued', 0) or 0,
+            },
+            'active_requests': reqs,
+            'updated': time.time(),
+        }
+    except Exception:
+        return dict(splash_status_cache) or {'ok': False}
 
 def extract_ollama(data):
     models = data.get('models', [])
@@ -186,11 +636,35 @@ def fetch_ollama():
     except:
         return {'online': False, 'count': 0, 'vram_used': 0, 'ram_used': 0, 'models': []}
 
+_last_splash_snapshot = {}
+
+def compute_splash_delta(s):
+    """Per-poll deltas of aggregate counters → approx per-request stats."""
+    global _last_splash_snapshot
+    last = _last_splash_snapshot
+    if not last:
+        _last_splash_snapshot = {k: s.get(k, 0) for k in
+            ('requests_submitted', 'requests_completed', 'prefill_tokens', 'decode_tokens', 'cache_reused_tokens')}
+        s['splash_delta'] = None
+        return s
+    d = {
+        'submitted': max(0, s.get('requests_submitted', 0) - last.get('requests_submitted', 0)),
+        'completed': max(0, s.get('requests_completed', 0) - last.get('requests_completed', 0)),
+        'input': max(0, s.get('prefill_tokens', 0) - last.get('prefill_tokens', 0)),
+        'output': max(0, s.get('decode_tokens', 0) - last.get('decode_tokens', 0)),
+        'cached': max(0, s.get('cache_reused_tokens', 0) - last.get('cache_reused_tokens', 0)),
+    }
+    _last_splash_snapshot = {k: s.get(k, 0) for k in
+        ('requests_submitted', 'requests_completed', 'prefill_tokens', 'decode_tokens', 'cache_reused_tokens')}
+    s['splash_delta'] = d
+    return s
+
 def update_loop():
-    global metrics_cache, macmon_cache, ollama_cache
+    global metrics_cache, macmon_cache, ollama_cache, llmstudio_cache, splash_status_cache
     while True:
         try:
             splash = fetch_data()
+            splash = compute_splash_delta(splash)
             macmon = fetch_macmon()
             ollama = fetch_ollama()
             record_history(splash, macmon)
@@ -199,18 +673,43 @@ def update_loop():
             ollama_cache['ollama'] = ollama
         except:
             pass
+        # Live status (/status) — small payload, same 5s cadence as the rest.
+        try:
+            st = fetch_splash_status()
+            if st.get('ok'):
+                splash_status_cache['splash_status'] = st
+        except:
+            pass
+        # LLM Studio is on a reachable endpoint independent of splash/ollama, so
+        # always update its cache even if the block above throws.
+        try:
+            llmstudio = fetch_llmstudio()
+            if llmstudio:
+                llmstudio_cache['llmstudio'] = llmstudio
+        except:
+            pass
+        # OpenCode Go quota is self-throttled (120s) and never raises.
+        try:
+            fetch_opencodego()
+        except:
+            pass
         time.sleep(5)
 
 threading.Thread(target=update_loop, daemon=True).start()
 
 DASHBOARD = '''<!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Mac Monitor</title>
 <style>
-:root {
+/* ===== THEME TOKENS =====
+   :root stays the DARK theme; the same tokens are re-applied under
+   html[data-theme="dark"] so the attribute always wins, and
+   html[data-theme="light"] overrides them with a light palette.
+   Every colour in this stylesheet comes from these tokens. */
+:root, html[data-theme="dark"] {
     --bg: #0f1117;
     --card: #181c25;
     --card-alt: #1e2330;
@@ -230,13 +729,203 @@ DASHBOARD = '''<!DOCTYPE html>
     --red-bg: rgba(234,67,53,0.12);
     --cream: #2d2a1f;
     --cream-border: #3d3825;
+    /* structure / component tokens (theme-aware) */
+    --track: #2a2f3a;
+    --seg-free: #3a3f4a;
+    --seg-free-legend: #5a6070;
+    --teal: #14b8a6;
+    --model-name: #e8d5a3;
+    --hover: rgba(255,255,255,0.06);
+    --hover-mid: rgba(255,255,255,0.10);
+    --hover-strong: rgba(255,255,255,0.16);
+    --overlay: rgba(0,0,0,0.6);
+    --danger-text: #ff8a8a;
+    --danger-bg: rgba(255,120,120,0.12);
+    --danger-bg-hover: rgba(255,120,120,0.28);
+    --danger-border: rgba(255,120,120,0.35);
+    --ok-soft: #4ade80;
+    --crit-soft: #ef4444;
+    --green-border: rgba(52,168,83,0.45);
+    --panel-shadow: 0 16px 40px rgba(0,0,0,0.50);
+    --panel-bg: #181c25;
+    --chart-grid: #2a2f3a;
+    --chart-axis: #5f6368;
+    --chart-fill: rgba(255,255,255,0.03);
+    color-scheme: dark;
+}
+html[data-theme="light"] {
+    --bg: #eef1f5;
+    --card: #ffffff;
+    --card-alt: #f5f7fa;
+    --border: #d7dde5;
+    --text: #16202b;
+    --text-dim: #53616f;
+    --text-mut: #8592a0;
+    --green: #1e8e3e;              /* same OK accent, tuned for white bg */
+    --green-bg: rgba(30,142,62,0.12);
+    --orange: #c77c00;
+    --orange-bg: rgba(199,124,0,0.12);
+    --purple: #7c3aed;
+    --purple-bg: rgba(124,58,237,0.10);
+    --blue: #2563eb;
+    --blue-bg: rgba(37,99,235,0.10);
+    --red: #d93025;
+    --red-bg: rgba(217,48,37,0.10);
+    --cream: #fff8e6;
+    --cream-border: #efe0b6;
+    --track: #e4e9ef;
+    --seg-free: #cdd5df;
+    --seg-free-legend: #9aa5b1;
+    --teal: #0f9488;
+    --model-name: #8a6414;
+    --hover: rgba(15,25,35,0.05);
+    --hover-mid: rgba(15,25,35,0.08);
+    --hover-strong: rgba(15,25,35,0.12);
+    --overlay: rgba(15,25,35,0.35);
+    --danger-text: #b3261e;
+    --danger-bg: rgba(217,48,37,0.08);
+    --danger-bg-hover: rgba(217,48,37,0.18);
+    --danger-border: rgba(217,48,37,0.35);
+    --ok-soft: #15803d;
+    --crit-soft: #dc2626;
+    --green-border: rgba(30,142,62,0.45);
+    --panel-shadow: 0 16px 40px rgba(15,25,35,0.18);
+    --panel-bg: #ffffff;
+    --chart-grid: #dde3ea;         /* charts stay readable on white */
+    --chart-axis: #6b7280;
+    --chart-fill: rgba(15,25,35,0.03);
+    color-scheme: light;
 }
 * { margin:0; padding:0; box-sizing:border-box; }
+
+/* === HEADER TOOLBAR + ADMIN PANEL (theme-aware) === */
+.header-right { display: flex; flex-direction: column; align-items: flex-end; gap: 8px; }
+.header-tools { display: flex; align-items: center; gap: 6px; }
+.icon-btn {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 30px; height: 28px; font-size: 14px; line-height: 1;
+    color: var(--text-dim); background: var(--hover-mid);
+    border: 1px solid var(--border); border-radius: 7px;
+    cursor: pointer; transition: background .15s, color .15s, border-color .15s;
+}
+.icon-btn:hover { background: var(--hover-strong); color: var(--text); }
+.icon-btn.active { color: var(--green); border-color: var(--green-border); background: var(--green-bg); }
+
+.admin-hidden { display: none !important; }
+.admin-panel {
+    position: fixed; top: 58px; right: 20px; z-index: 900;
+    width: 380px; max-width: calc(100vw - 32px); max-height: calc(100vh - 82px);
+    overflow-y: auto;
+    background: var(--panel-bg); color: var(--text);
+    border: 1px solid var(--border); border-radius: 12px;
+    box-shadow: var(--panel-shadow);
+    animation: adminSlide .16s ease-out;
+}
+@keyframes adminSlide { from { opacity: 0; transform: translateY(-8px); } to { opacity: 1; transform: none; } }
+.admin-panel-head {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 12px 16px; border-bottom: 1px solid var(--border);
+    position: sticky; top: 0; background: var(--panel-bg); z-index: 1;
+}
+.admin-panel-title { font-size: 14px; font-weight: 700; letter-spacing: .2px; }
+.admin-close {
+    width: 26px; height: 26px; border-radius: 6px; cursor: pointer;
+    font-size: 13px; line-height: 1; color: var(--text-dim);
+    background: var(--hover-mid); border: 1px solid var(--border);
+}
+.admin-close:hover { background: var(--hover-strong); color: var(--text); }
+.admin-panel-body { padding: 8px 16px 16px; }
+.admin-sec { padding: 12px 0; border-bottom: 1px solid var(--border); }
+.admin-sec:last-child { border-bottom: none; }
+.admin-sec-title {
+    font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px;
+    color: var(--text-dim); margin-bottom: 8px;
+}
+.admin-slot { font-size: 12px; color: var(--text-dim); }
+.admin-slot:empty::before { content: 'Sin opciones'; font-size: 11px; color: var(--text-mut); font-style: italic; }
+.admin-slot label { display: flex; align-items: center; gap: 8px; padding: 3px 0; font-size: 12px; color: var(--text-dim); }
+.admin-slot input[type="range"] { flex: 1; accent-color: var(--green); }
+.admin-slot select, .admin-slot input[type="text"], .admin-slot input[type="number"] {
+    background: var(--card-alt); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 4px 8px; font-size: 12px;
+}
+.admin-slot button {
+    background: var(--hover-mid); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 4px 10px; font-size: 11px; cursor: pointer;
+}
+.admin-slot button:hover { background: var(--hover-strong); }
+/* === CARD LAYOUT (visibilidad / columnas) — aplicado por applyCardLayout() === */
+.stats-row[data-mode="onecol"], .bottom-row[data-mode="onecol"], .charts-row[data-mode="onecol"] {
+    grid-template-columns: minmax(0, 1fr) !important;
+}
+.stats-row[data-mode="twocol"], .bottom-row[data-mode="twocol"], .charts-row[data-mode="twocol"] {
+    grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+}
+.admin-slot .ad-note { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin: 10px 0 4px; }
+.admin-slot .ad-note:first-child { margin-top: 0; }
+.admin-slot .ad-modes { display: flex; flex-wrap: wrap; gap: 2px 16px; }
+.admin-slot .ad-check, .admin-slot .ad-radio { display: flex; align-items: center; gap: 8px; padding: 3px 0; font-size: 12px; color: var(--text-dim); cursor: pointer; }
+.admin-slot .ad-check input, .admin-slot .ad-radio input { accent-color: var(--blue); margin: 0; cursor: pointer; }
+.admin-slot .ad-order-row { display: flex; align-items: center; gap: 8px; padding: 3px 0; font-size: 12px; color: var(--text-dim); }
+.admin-slot .ad-order-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.admin-slot .ad-order-btns { display: flex; gap: 4px; }
+.admin-slot .ad-mini { padding: 1px 7px; font-size: 11px; line-height: 1.4; min-width: 24px; }
+.admin-slot .ad-mini:disabled { opacity: .35; cursor: default; }
+.admin-slot .ad-actions { margin-top: 10px; }
+
+@media (max-width: 520px) {
+    .admin-panel { right: 8px; left: 8px; width: auto; }
+}
 body {
     background: var(--bg); color: var(--text);
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
     padding: 20px 24px; min-height: 100vh;
 }
+
+/* === CUSTOM BACKGROUND IMAGE (admin → Fondo) ===
+   --bg-image is set by JS (setBg) to url('/bg/<file>') or removed.
+   body.has-bg only turns the photo on; cards get a glassy, still-legible
+   surface because the photo would otherwise bleed through them. */
+body {
+    background-image: var(--bg-image, none);
+    background-size: cover;
+    background-attachment: fixed;
+    background-position: center;
+    background-repeat: no-repeat;
+}
+body.has-bg { --card-glass: rgba(24,28,37,0.72); --card-glass-alt: rgba(30,35,48,0.72); }
+html[data-theme="light"] body.has-bg { --card-glass: rgba(255,255,255,0.80); --card-glass-alt: rgba(245,247,250,0.80); }
+body.has-bg .node-card,
+body.has-bg .stat-card,
+body.has-bg .bottom-card,
+body.has-bg .chart-card,
+body.has-bg .modal {
+    background: var(--card-glass) !important;
+    -webkit-backdrop-filter: blur(12px) saturate(1.15);
+    backdrop-filter: blur(12px) saturate(1.15);
+}
+body.has-bg .header { text-shadow: 0 1px 3px rgba(0,0,0,0.45); }
+html[data-theme="light"] body.has-bg .header { text-shadow: 0 1px 3px rgba(255,255,255,0.6); }
+/* admin panel stays opaque-ish so controls remain readable over a photo */
+body.has-bg .admin-panel { background: var(--card-glass-alt, var(--panel-bg)); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); }
+
+/* bg section controls */
+.bg-thumb {
+    display: block; width: 100%; height: 96px; object-fit: cover;
+    border-radius: 8px; border: 1px solid var(--border); margin: 6px 0 8px;
+    background: var(--card-alt);
+}
+.bg-thumb.bg-empty { display: flex; align-items: center; justify-content: center;
+    font-size: 11px; color: var(--text-mut); font-style: italic; }
+.bg-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.bg-file-label {
+    display: inline-block; cursor: pointer; user-select: none;
+    background: var(--hover-mid); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 5px 12px; font-size: 11px; font-weight: 600;
+}
+.bg-file-label:hover { background: var(--hover-strong); }
+.bg-file-label input[type="file"] { display: none; }
+.bg-status { font-size: 11px; color: var(--text-mut); min-height: 14px; }
 
 /* === HEADER === */
 .header {
@@ -273,24 +962,26 @@ body {
     border-radius: 4px; text-transform: uppercase; letter-spacing: 0.5px;
 }
 .node-badge.head { background: var(--orange-bg); color: var(--orange); }
-.node-badge.worker { background: rgba(255,255,255,0.06); color: var(--text-dim); }
+.node-badge.worker { background: var(--hover); color: var(--text-dim); }
 .node-ip { margin-left: auto; font-size: 11px; color: var(--text-mut); }
 
 /* Memory section */
 .mem-section { margin-bottom: 12px; }
 .mem-label { font-size: 11px; color: var(--text-dim); margin-bottom: 4px; }
 .mem-free { font-size: 14px; font-weight: 700; margin-bottom: 6px; }
-.mem-bar { height: 8px; background: #2a2f3a; border-radius: 4px; overflow: hidden; display: flex; }
+.mem-bar { height: 8px; background: var(--track); border-radius: 4px; overflow: hidden; display: flex; }
 .mem-bar-splash { background: var(--green); height: 100%; }
 .mem-bar-ollama { background: var(--blue); height: 100%; }
+.mem-bar-llmstudio { background: var(--teal); height: 100%; }
 .mem-bar-sys { background: var(--purple); height: 100%; }
-.mem-bar-free { background: #3a3f4a; height: 100%; }
+.mem-bar-free { background: var(--seg-free); height: 100%; }
 .mem-legend { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 5px; font-size: 10px; color: var(--text-dim); }
 .mem-legend span::before { content: '● '; }
 .mem-legend .lg-splash::before { color: var(--green); }
 .mem-legend .lg-ollama::before { color: var(--blue); }
+.mem-legend .lg-llmstudio::before { color: var(--teal); }
 .mem-legend .lg-sys::before { color: var(--purple); }
-.mem-legend .lg-free::before { color: #5a6070; }
+.mem-legend .lg-free::before { color: var(--seg-free-legend); }
 
 /* GPU metrics row */
 .gpu-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 14px; }
@@ -298,7 +989,7 @@ body {
 .gpu-label { font-size: 10px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px; }
 .gpu-val { font-size: 16px; font-weight: 700; margin-bottom: 5px; }
 .gpu-val .unit { font-size: 11px; font-weight: 400; color: var(--text-dim); }
-.bar { height: 6px; background: #2a2f3a; border-radius: 3px; overflow: hidden; }
+.bar { height: 6px; background: var(--track); border-radius: 3px; overflow: hidden; }
 .bar-fill { height: 100%; border-radius: 3px; transition: width 0.5s ease; }
 .bar-fill.orange { background: var(--orange); }
 .bar-fill.green { background: var(--green); }
@@ -332,16 +1023,16 @@ body {
     background: var(--cream); border: 1px solid var(--cream-border);
     border-radius: 8px; padding: 10px 14px;
 }
-.model-name { font-size: 13px; font-weight: 600; color: #e8d5a3; }
-.model-ctx { font-size: 10px; color: var(--text-dim); background: rgba(255,255,255,0.06); padding: 2px 6px; border-radius: 4px; }
+.model-name { font-size: 13px; font-weight: 600; color: var(--model-name); }
+.model-ctx { font-size: 10px; color: var(--text-dim); background: var(--hover); padding: 2px 6px; border-radius: 4px; }
 .release-btn {
     margin-left: 8px; cursor: pointer; user-select: none;
     font-size: 10px; font-weight: 700; letter-spacing: 0.5px;
-    color: #ff8a8a; background: rgba(255,120,120,0.12);
-    border: 1px solid rgba(255,120,120,0.35); border-radius: 6px;
+    color: var(--danger-text); background: var(--danger-bg);
+    border: 1px solid var(--danger-border); border-radius: 6px;
     padding: 4px 9px; transition: all 0.15s;
 }
-.release-btn:hover { background: rgba(255,120,120,0.28); }
+.release-btn:hover { background: var(--danger-bg-hover); }
 .release-btn:disabled { opacity: 0.5; cursor: wait; }
 
 /* === AGGREGATE STATS === */
@@ -356,7 +1047,7 @@ body {
 .stat-sub { font-size: 10px; color: var(--text-mut); margin-top: 4px; }
 .stat-spark { margin-top: 8px; height: 28px; }
 .stat-spark canvas { width: 100%; height: 28px; }
-.stat-bar { height: 5px; background: #2a2f3a; border-radius: 3px; margin-top: 8px; overflow: hidden; }
+.stat-bar { height: 5px; background: var(--track); border-radius: 3px; margin-top: 8px; overflow: hidden; }
 .stat-bar-fill { height: 100%; border-radius: 3px; transition: width 0.5s; }
 
 /* === BOTTOM ROW === */
@@ -369,12 +1060,32 @@ body {
     display: flex; align-items: center; gap: 8px; margin-bottom: 10px;
 }
 .bc-title { font-size: 13px; font-weight: 600; }
-.bc-badge { font-size: 10px; color: var(--text-dim); background: rgba(255,255,255,0.06); padding: 2px 6px; border-radius: 4px; }
-.bc-btn { font-size: 10px; color: var(--text-dim); background: rgba(255,255,255,0.08); border: none; padding: 3px 8px; border-radius: 4px; cursor: pointer; margin-left: auto; }
-.bc-btn:hover { background: rgba(255,255,255,0.14); }
+.bc-badge { font-size: 10px; color: var(--text-dim); background: var(--hover); padding: 2px 6px; border-radius: 4px; }
+.bc-btn { font-size: 10px; color: var(--text-dim); background: var(--hover-mid); border: none; padding: 3px 8px; border-radius: 4px; cursor: pointer; margin-left: auto; }
+.bc-btn:hover { background: var(--hover-strong); }
 .bc-big { font-size: 26px; font-weight: 700; }
 .bc-big .unit { font-size: 12px; font-weight: 400; color: var(--text-dim); }
+/* Energy card: range switcher (1h / 24h / 1sem / 1mes / 3meses) */
+.energy-ranges { display: inline-flex; gap: 3px; margin-left: auto; }
+.energy-range-btn {
+    font-size: 9px; line-height: 1.3; padding: 2px 5px; cursor: pointer;
+    border-radius: 4px; border: 1px solid var(--border);
+    background: var(--hover-mid); color: var(--text-dim); font-family: inherit;
+}
+.energy-range-btn:hover { background: var(--hover-strong); color: var(--text); }
+.energy-range-btn.active { background: var(--orange-bg); color: var(--orange); border-color: var(--orange); }
 .bc-sub { font-size: 10px; color: var(--text-mut); margin: 4px 0 10px; }
+/* OpenCode Go delegation-quota block (separate block inside "Token totals") */
+.go-block { margin-top: 10px; padding-top: 8px; border-top: 1px dashed var(--border); }
+.go-head { font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 5px; }
+.go-row { display: flex; align-items: baseline; gap: 8px; font-size: 11px; padding: 2px 0; }
+.go-name { color: var(--text-dim); min-width: 58px; text-transform: capitalize; }
+.go-pct { font-weight: 600; min-width: 46px; text-align: right; }
+.go-pct.go-ok { color: var(--ok-soft); }
+.go-pct.go-warn { color: var(--orange); }
+.go-pct.go-crit { color: var(--crit-soft); }
+.go-reset { margin-left: auto; color: var(--text-dim); font-size: 10px; }
+.go-unavailable { font-size: 11px; color: var(--text-mut); opacity: .75; font-style: italic; }
 .bc-chart { height: 80px; margin-bottom: 10px; }
 .bc-chart canvas { width: 100%; height: 80px; }
 .bc-footer { display: grid; grid-template-columns: repeat(auto-fit, minmax(70px, 1fr)); gap: 8px; }
@@ -399,6 +1110,16 @@ body {
 /* Activity log */
 .live-badge { display: inline-flex; align-items: center; gap: 4px; font-size: 10px; color: var(--green); font-weight: 600; margin-left: auto; }
 .live-badge::before { content: '●'; animation: pulse 2s infinite; }
+.live-badge.paused { color: var(--text-mut); }
+.live-badge.paused::before { content: '●'; animation: none; color: var(--text-mut); }
+.act-toggle {
+    font-size: 9px; font-weight: 700; letter-spacing: .04em;
+    color: var(--text-dim); background: var(--hover-mid);
+    border: 1px solid var(--border); border-radius: 4px;
+    padding: 2px 7px; cursor: pointer; margin-left: 6px; line-height: 1.4;
+}
+.act-toggle:hover { background: var(--hover-strong); color: var(--text); }
+.act-toggle.on { color: var(--green); border-color: var(--green-border); }
 @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
 .activity-list { list-style: none; max-height: 180px; overflow-y: auto; }
 .activity-list li { display: flex; align-items: center; gap: 8px; padding: 6px 0; font-size: 11px; border-bottom: 1px solid var(--border); }
@@ -421,7 +1142,7 @@ body {
 .chart-legend .lg { font-weight: 700; }
 
 /* Modal for Details buttons */
-.modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center; z-index: 1000; }
+.modal-overlay { position: fixed; inset: 0; background: var(--overlay); display: flex; align-items: center; justify-content: center; z-index: 1000; }
 .modal { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 20px 24px; max-width: 560px; width: 90%; max-height: 80vh; overflow-y: auto; }
 .modal h3 { margin: 0 0 4px; font-size: 15px; }
 .modal .modal-sub { font-size: 11px; color: var(--text-mut); margin-bottom: 14px; }
@@ -429,8 +1150,8 @@ body {
 .modal th, .modal td { text-align: right; padding: 6px 8px; border-bottom: 1px solid var(--border); }
 .modal th { color: var(--text-dim); font-weight: 600; text-transform: uppercase; font-size: 10px; }
 .modal th:first-child, .modal td:first-child { text-align: left; }
-.modal .modal-close { margin-top: 16px; width: 100%; background: rgba(255,255,255,0.08); border: none; color: var(--text); padding: 8px; border-radius: 6px; cursor: pointer; font-size: 12px; }
-.modal .modal-close:hover { background: rgba(255,255,255,0.15); }
+.modal .modal-close { margin-top: 16px; width: 100%; background: var(--hover-mid); border: none; color: var(--text); padding: 8px; border-radius: 6px; cursor: pointer; font-size: 12px; }
+.modal .modal-close:hover { background: var(--hover-strong); }
 .chart-canvas { width: 100%; height: 100px; }
 
 @media (max-width: 900px) {
@@ -453,11 +1174,47 @@ body {
             <span>· <span id="mem-total-label">54.5 GB</span> unified memory</span>
         </div>
     </div>
-    <div class="header-right" id="header-status"></div>
+    <div class="header-right">
+        <div class="header-tools">
+            <button class="icon-btn" id="theme-btn" type="button" title="Cambiar tema (claro/oscuro)" aria-label="Cambiar tema"><span id="theme-btn-icon">☀</span></button>
+            <button class="icon-btn" id="admin-btn" type="button" title="Ajustes" aria-label="Ajustes" aria-expanded="false" aria-controls="admin-panel">⚙</button>
+        </div>
+        <div id="header-status"></div>
+    </div>
+</div>
+
+<!-- ADMIN SETTINGS PANEL (opened by #admin-btn; body is filled by per-section registries) -->
+<div id="admin-panel" class="admin-panel admin-hidden" role="dialog" aria-labelledby="admin-panel-title" aria-modal="false">
+    <div class="admin-panel-head">
+        <div class="admin-panel-title" id="admin-panel-title">Ajustes</div>
+        <button class="admin-close" id="admin-close" type="button" title="Cerrar" aria-label="Cerrar">✕</button>
+    </div>
+    <div class="admin-panel-body" id="admin-panel-body">
+        <div class="admin-sec" id="admin-sec-bg" data-attr="bg" data-slot="bg">
+            <div class="admin-sec-title">Fondo</div>
+            <div class="admin-slot" id="admin-slot-bg" data-slot="bg"></div>
+        </div>
+        <div class="admin-sec" id="admin-sec-layout" data-attr="layout" data-slot="layout">
+            <div class="admin-sec-title">Diseño</div>
+            <div class="admin-slot" id="admin-slot-layout" data-slot="layout"></div>
+        </div>
+        <div class="admin-sec" id="admin-sec-cards" data-attr="cards" data-slot="cards">
+            <div class="admin-sec-title">Tarjetas</div>
+            <div class="admin-slot" id="admin-slot-cards" data-slot="cards"></div>
+        </div>
+        <div class="admin-sec" id="admin-sec-energy" data-attr="energy" data-slot="energy">
+            <div class="admin-sec-title">Energia e historial</div>
+            <div class="admin-slot" id="admin-slot-energy" data-slot="energy"></div>
+        </div>
+        <div class="admin-sec" id="admin-sec-refresh" data-attr="refresh" data-slot="refresh">
+            <div class="admin-sec-title">Refresco</div>
+            <div class="admin-slot" id="admin-slot-refresh" data-slot="refresh"></div>
+        </div>
+    </div>
 </div>
 
 <!-- NODE CARD -->
-<div id="node-card"></div>
+<div id="node-card" data-card="node"></div>
 
 <!-- AGGREGATE STATS -->
 <div class="stats-row" id="stats-row"></div>
@@ -469,14 +1226,135 @@ body {
 <div class="charts-row" id="charts-row"></div>
 
 <script>
-const REFRESH_MS = 5000;
+// ─── Theme bootstrap: must run before anything else renders ──────────────────
+// (literal key here on purpose: THEME_KEY is declared below and would be in TDZ)
+(function () {
+    var saved = 'dark';
+    try { saved = localStorage.getItem('dashsplash.theme') || 'dark'; } catch (e) {}
+    document.documentElement.setAttribute('data-theme', saved === 'light' ? 'light' : 'dark');
+})();
+
+const REFRESH_MS = 5000;             // DEFAULT poll interval (ms); runtime value lives in currentRefreshMs
+// ── Refresh interval control (user-adjustable poll cadence) ─────────────────
+// currentRefreshMs is the effective interval: seeded from GET /api/settings.refreshMs
+// on load when valid, otherwise REFRESH_MS. Every poll re-reads it, so changing it
+// takes effect on the next tick without a reload.
+let currentRefreshMs = REFRESH_MS;
+let refreshTimerId = null;           // pending poll timer; replaced when the interval changes
+let refreshInFlight = false;         // true while a fetchData() cycle is running
+
+function fmtRefreshMs(ms) {
+    const n = Number(ms) || 0;
+    if (n >= 60000 && n % 60000 === 0) return (n / 60000) + ' min';
+    if (n >= 1000) return (n / 1000).toFixed(n % 1000 === 0 ? 0 : 1) + ' s';
+    return n + ' ms';
+}
+
+function schedulePoll() {
+    if (refreshTimerId !== null) { clearTimeout(refreshTimerId); refreshTimerId = null; }
+    refreshTimerId = setTimeout(fetchData, currentRefreshMs);
+    return refreshTimerId;
+}
+
+// Validate + clamp (500 ms floor keeps the dashboard from hot-looping the API).
+function applyRefreshMs(ms, reschedule) {
+    const n = Math.round(Number(ms));
+    if (!isFinite(n) || n <= 0) return false;
+    currentRefreshMs = Math.max(500, Math.min(600000, n));
+    if (reschedule) schedulePoll();
+    refreshUpdateHint();
+    return true;
+}
+
+function refreshUpdateHint() {
+    const hint = document.getElementById('refresh-hint');
+    if (!hint) return;
+    const preset = [1000, 3000, 5000, 10000, 30000, 60000].indexOf(currentRefreshMs) !== -1;
+    hint.innerHTML = 'Intervalo actual: <b>' + fmtRefreshMs(currentRefreshMs) + '</b> (' +
+        currentRefreshMs + ' ms)' + (preset ? '' : ' · personalizado');
+}
+
+function saveRefreshSetting(ms) {
+    try {
+        fetch('/api/settings', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({refreshMs: ms}),
+        }).then(r => r.json()).catch(() => {});
+    } catch (e) {}
+}
+
+function loadRefreshSetting() {
+    try {
+        fetch('/api/settings').then(r => r.json()).then(s => {
+            const ms = Number(s && s.refreshMs);
+            if (isFinite(ms) && ms >= 500) {
+                currentRefreshMs = Math.min(600000, Math.round(ms));
+                refreshUpdateHint();
+            }
+        }).catch(() => {});
+    } catch (e) {}
+}
+
 const history = {};
 const historyKeys = ['memory_used','memory_limit','decode_tps','prefill_tps','ttft_p50','itl_p50','gpu_temp','cpu_temp','gpu_power','sys_power','gpu_util','gpu_freq','fan_rpm'];
 historyKeys.forEach(k => history[k] = []);
-let lastSplash = {}, lastMacmon = {}, lastOllama = {};
+let lastSplash = {}, lastMacmon = {}, lastOllama = {}, lastLlmstudio = {}, lastGo = {};
 let activityLog = [];
 let startTime = Date.now();
 let lastEnergy = 0;
+// ─── Energy range state (persisted history; keys match /api/energy/* ?range=) ──
+const ENERGY_RANGE_META = [
+    {key: '1h',  label: '1h',      unit: '1 h'},
+    {key: '24h', label: '24h',     unit: '24 h'},
+    {key: '7d',  label: '1sem',    unit: '1 semana'},
+    {key: '30d', label: '1mes',    unit: '1 mes'},
+    {key: '90d', label: '3meses',  unit: '3 meses'},
+];
+let energyRange = '1h';       // selected range (POSTed to /api/settings.energyRange)
+let energyPoints = [];        // [{t: ms, watts, gpu}] from /api/energy/history
+let energyAgg = null;         // {kwh, cost, samples, start, end} for the range
+function energyRangeMeta(key) {
+    return ENERGY_RANGE_META.find(r => r.key === key) || ENERGY_RANGE_META[0];
+}
+function energyFetch() {
+    const rng = energyRange;
+    return fetch('/api/energy/history?range=' + encodeURIComponent(rng))
+        .then(r => r.json())
+        .then(d => {
+            if (!d || rng !== energyRange) return;          // stale answer, dropped
+            energyPoints = (d.points || []).map(p => ({t: p.t * 1000, watts: p.watts, gpu: p.gpu_watts || 0}));
+            energyAgg = {
+                kwh: typeof d.kwh === 'number' ? d.kwh : 0,
+                cost: typeof d.cost === 'number' ? d.cost : (d.kwh || 0) * KWH_PRICE,
+                samples: d.samples || 0, start: d.start, end: d.end,
+            };
+            if (typeof renderBottom === 'function' && lastMacmon && Object.keys(lastMacmon).length) {
+                renderBottom(lastSplash, lastMacmon, lastOllama, lastLlmstudio, lastGo);
+            }
+        })
+        .catch(() => {});                                   // keep last good points
+}
+function setEnergyRange(key) {
+    if (!ENERGY_RANGE_META.some(r => r.key === key)) return;
+    energyRange = key;
+    energyPoints = []; energyAgg = null;
+    try {
+        fetch('/api/settings', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({energyRange: key}),
+        }).catch(() => {});
+    } catch (e) {}
+    energyFetch();
+    if (typeof renderBottom === 'function' && lastMacmon && Object.keys(lastMacmon).length) {
+        renderBottom(lastSplash, lastMacmon, lastOllama, lastLlmstudio, lastGo);
+    }
+}
+// Thinking indicator: previous /api/splash_status snapshot + active request ids
+let lastSplashStatus = {};
+let prevActiveIds = new Set();
+let prevActiveCount = 0;
 const KWH_PRICE = parseFloat("__KWH_PRICE__") || 0.13;  // € per kWh (injected from .env)
 
 function gb(b) { return b / 1e9; }
@@ -495,9 +1373,10 @@ function pushHistory(key, val, now) {
     while (history[key].length > 720) history[key].shift();
 }
 
-function renderNode(splash, macmon, ollama) {
+function renderNode(splash, macmon, ollama, llmstudio) {
     const card = document.getElementById('node-card');
     ollama = ollama || {};
+    llmstudio = llmstudio || {};
     const thermal = splash.thermal_state || 'nominal';
     const gt = macmon.gpu_temp || 0;
     const gp = macmon.gpu_power || 0;
@@ -512,15 +1391,17 @@ function renderNode(splash, macmon, ollama) {
     const rmTot = macmon.mem_total || 54.5e9;
     const rmUsed = macmon.mem_used || 0;
     const ollGB = gb(ollama.ram_used || 0);
+    const lsGB = gb(llmstudio.ram_used || 0);   // estimated from loaded model weights
     const totGB = gb(rmTot);
     const freeGB = Math.max(0, totGB - gb(rmUsed));
     const splashGB = gb(mu);
     // segmentos de la barra (acotados a 100%)
     let sPct = totGB > 0 ? Math.min(100, splashGB / totGB * 100) : 0;
     let oPct = totGB > 0 ? Math.min(Math.max(0, 100 - sPct), ollGB / totGB * 100) : 0;
-    let sysGB = Math.max(0, gb(rmUsed) - splashGB - ollGB);
-    let sysPct = totGB > 0 ? Math.min(Math.max(0, 100 - sPct - oPct), sysGB / totGB * 100) : 0;
-    let freePct = Math.max(0, 100 - sPct - oPct - sysPct);
+    let lPct = totGB > 0 ? Math.min(Math.max(0, 100 - sPct - oPct), lsGB / totGB * 100) : 0;
+    let sysGB = Math.max(0, gb(rmUsed) - splashGB - ollGB - lsGB);
+    let sysPct = totGB > 0 ? Math.min(Math.max(0, 100 - sPct - oPct - lPct), sysGB / totGB * 100) : 0;
+    let freePct = Math.max(0, 100 - sPct - oPct - lPct - sysPct);
     const sd = splash.scheduler_decoding || 0;
     const sp2 = splash.scheduler_prefilling || 0;
     const sq = splash.scheduler_queued || 0;
@@ -545,12 +1426,14 @@ function renderNode(splash, macmon, ollama) {
             <div class="mem-bar">
                 <div class="mem-bar-splash" style="width:${sPct}%"></div>
                 <div class="mem-bar-ollama" style="width:${oPct}%"></div>
+                <div class="mem-bar-llmstudio" style="width:${lPct}%"></div>
                 <div class="mem-bar-sys" style="width:${sysPct}%"></div>
                 <div class="mem-bar-free" style="width:${freePct}%"></div>
             </div>
             <div class="mem-legend">
                 <span class="lg-splash">Splash ${splashGB.toFixed(1)} GB</span>
                 <span class="lg-ollama">Ollama ${ollGB.toFixed(1)} GB</span>
+                ${lsGB > 0.05 ? `<span class="lg-llmstudio" title="estimated from loaded weights (incl. KV-cache)">LLM Studio ${lsGB.toFixed(1)} GB</span>` : ''}
                 <span class="lg-sys">System ${sysGB.toFixed(1)} GB</span>
                 <span class="lg-free">Free ${freeGB.toFixed(1)} GB</span>
             </div>
@@ -611,6 +1494,18 @@ function renderNode(splash, macmon, ollama) {
             <span style="margin-left:auto;font-size:11px;color:var(--text-dim)">${ollama.count} model${ollama.count>1?'s':''} loaded</span>
             <button class="release-btn" onclick="releaseModel('ollama', this)">▼ RELEASE</button>
         </div>` : ''}
+
+        ${llmstudio && llmstudio.models && llmstudio.models.length > 0 ? `
+        <div class="divider"></div>
+        <div class="model-box" style="background:var(--orange-bg);border-color:var(--orange)">
+            <span style="font-size:11px;color:var(--orange);font-weight:700;text-transform:uppercase">LLM Studio</span>
+            ${llmstudio.models.map(mo => `
+            <span class="model-name" style="color:var(--orange)">${mo.id}</span>
+            <span class="model-ctx">${mo.tps ? mo.tps + ' t/s' : 'idle'}</span>
+            `).join('')}
+            <span style="margin-left:auto;font-size:11px;color:var(--text-dim)">${llmstudio.models.length} loaded</span>
+            <button class="release-btn" onclick="releaseModel('llmstudio', this)">▼ RELEASE</button>
+        </div>` : ''}
     </div>`;
 }
 
@@ -625,17 +1520,17 @@ function renderStats(splash, macmon) {
     const prefillTokens = splash.prefill_tokens || 0;
 
     row.innerHTML = `
-    <div class="stat-card">
+    <div class="stat-card" data-card="stat-decode">
         <div class="stat-label">MAC DECODE</div>
         <div class="stat-value">${dtps.toFixed(1)} <span class="unit">tok/s</span></div>
         <div class="stat-spark"><canvas id="spark-decode"></canvas></div>
     </div>
-    <div class="stat-card">
+    <div class="stat-card" data-card="stat-power">
         <div class="stat-label">MAC POWER</div>
         <div class="stat-value">${sp.toFixed(0)} <span class="unit">W</span></div>
         <div class="stat-spark"><canvas id="spark-power"></canvas></div>
     </div>
-    <div class="stat-card">
+    <div class="stat-card" data-card="stat-memory">
         <div class="stat-label">MEMORY IN USE</div>
         <div style="display:flex;align-items:baseline;gap:6px">
             <div class="stat-value" style="color:var(--blue)">${memPct.toFixed(0)}%</div>
@@ -643,7 +1538,7 @@ function renderStats(splash, macmon) {
         </div>
         <div class="stat-bar"><div class="stat-bar-fill" style="width:${memPct}%;background:var(--blue)"></div></div>
     </div>
-    <div class="stat-card">
+    <div class="stat-card" data-card="stat-tokens">
         <div class="stat-label">TOKENS TODAY</div>
         <div class="stat-value">${fmtToks(genTokens)}</div>
         <div class="stat-sub">generated · ${fmtToks(prefillTokens)} prefill</div>
@@ -698,7 +1593,47 @@ function energyKWh() {
     return kwh;
 }
 
-function renderBottom(splash, macmon, ollama) {
+function goResetLabel(iso) {
+    try {
+        if (!iso) return 'no reset info';
+        const t = new Date(iso).getTime();
+        if (isNaN(t)) return 'no reset info';
+        const ms = t - Date.now();
+        if (ms <= 0) return 'resetting now';
+        const days = ms / 86400000;
+        if (days >= 1) return 'resets in ' + Math.floor(days) + 'd';
+        const hours = ms / 3600000;
+        if (hours >= 1) return 'resets in ' + Math.floor(hours) + 'h';
+        return 'resets in ' + Math.max(1, Math.floor(ms / 60000)) + 'm';
+    } catch (e) {
+        return 'no reset info';
+    }
+}
+
+function goUsageHTML(go) {
+    const head = '<div class="go-head">OpenCode Go (delegation quota)</div>';
+    try {
+        if (!go || !go.online) {
+            const why = (go && go.reason) ? ' · ' + go.reason : '';
+            return `<div class="go-block" id="go-usage-block">${head}<div class="go-unavailable">unavailable${why}</div></div>`;
+        }
+        const labels = { rolling: 'Rolling', weekly: 'Weekly', monthly: 'Monthly' };
+        const rows = ['rolling', 'weekly', 'monthly'].map(k => {
+            const w = (go.windows || {})[k] || {};
+            const pct = (typeof w.percent === 'number') ? w.percent : null;
+            const cls = pct === null ? '' : (pct >= 90 ? 'go-crit' : (pct >= 70 ? 'go-warn' : 'go-ok'));
+            const pctTxt = pct === null ? '—' : pct.toFixed(1) + '%';
+            return `<div class="go-row"><span class="go-name">${labels[k]}</span>`
+                + `<span class="go-pct ${cls}">${pctTxt}</span>`
+                + `<span class="go-reset">${goResetLabel(w.resetsAt)}</span></div>`;
+        }).join('');
+        return `<div class="go-block" id="go-usage-block">${head}${rows}</div>`;
+    } catch (e) {
+        return `<div class="go-block" id="go-usage-block">${head}<div class="go-unavailable">unavailable</div></div>`;
+    }
+}
+
+function renderBottom(splash, macmon, ollama, llmstudio, go) {
     const row = document.getElementById('bottom-row');
     const sp = macmon.sys_power || 0;
     const gp = macmon.gpu_power || 0;
@@ -708,16 +1643,25 @@ function renderBottom(splash, macmon, ollama) {
     const cachedTokens = splash.cache_reused_tokens || 0;
     const totalTokens = genTokens + cachedTokens + prefillTokens;
 
-    // Energy estimate (kWh since dashboard started, trapezoid of sys_power)
-    const eKWh = energyKWh();
-    const cost = eKWh * KWH_PRICE;
+    // Energy: range-aware (persisted history). 1h keeps the live-session feel
+    // by falling back to the in-memory trapezoid when the store has no samples.
+    const eKWhLive = energyKWh();
+    const rangeMeta = energyRangeMeta(energyRange);
+    const hasAgg = !!(energyAgg && energyAgg.samples > 0);
+    const eKWh = hasAgg ? energyAgg.kwh : (energyRange === '1h' ? eKWhLive : 0);
+    const cost = hasAgg ? energyAgg.cost : eKWh * KWH_PRICE;
     const elapsedH = (Date.now() - startTime) / 3600000;
     const efficiency = genTokens > 0 ? (eKWh / genTokens * 1e6).toFixed(4) : '—';
+    const rangeSub = hasAgg
+        ? `${energyAgg.samples} muestras · ${rangeMeta.unit}`
+        : (energyRange === '1h'
+            ? 'sesión en vivo · ' + (elapsedH > 0.01 ? (elapsedH*60).toFixed(0) + ' min' : 'just started')
+            : 'sin historial guardado');
 
     let activityHTML;
     const actItems = activityLog.slice(-8).reverse();
     if (actItems.length === 0) {
-        activityHTML = '<li><span class="act-time">—</span><span class="act-dot blue"></span><span class="act-text">Monitoring started</span></li>';
+        activityHTML = '<li><span class="act-time">—</span><span class="act-dot blue"></span><span class="act-text">Waiting for events…</span></li>';
     } else {
         activityHTML = actItems.map(item => {
             const ago = Math.floor((Date.now() - item.t) / 60000);
@@ -727,24 +1671,25 @@ function renderBottom(splash, macmon, ollama) {
     }
 
     row.innerHTML = `
-    <div class="bottom-card">
+    <div class="bottom-card" data-card="energy">
         <div class="bc-header">
             <span class="bc-title">Energy</span>
             <span class="bc-badge">1/1 fresh</span>
-            <button class="bc-btn" onclick="openEnergyDetails()">Details</button>
+            <span class="energy-ranges">${ENERGY_RANGE_META.map(r => `<button type="button" class="energy-range-btn${r.key === energyRange ? ' active' : ''}" data-range="${r.key}" onclick="setEnergyRange('${r.key}')">${r.label}</button>`).join('')}</span>
+            <button class="bc-btn" style="margin-left:6px" onclick="openEnergyDetails()">Details</button>
         </div>
-        <div class="bc-big">${eKWh.toFixed(2)} <span class="unit">kWh / session</span></div>
-        <div class="bc-sub">${cost.toFixed(2)} € · ${KWH_PRICE.toFixed(2)} €/kWh · ${elapsedH > 0.01 ? (elapsedH*60).toFixed(0) + ' min' : 'just started'}</div>
+        <div class="bc-big">${eKWh.toFixed(2)} <span class="unit">kWh / ${rangeMeta.unit}</span></div>
+        <div class="bc-sub">${cost.toFixed(2)} € · ${KWH_PRICE.toFixed(2)} €/kWh · ${rangeSub}</div>
         <div class="bc-chart"><canvas id="energy-chart"></canvas></div>
         <div class="bc-footer">
             <div class="ff-item"><div class="ff-label">Current</div><div class="ff-val">${sp.toFixed(0)} W</div></div>
-            <div class="ff-item"><div class="ff-label">Session</div><div class="ff-val">${eKWh.toFixed(2)} kWh</div></div>
+            <div class="ff-item"><div class="ff-label">${rangeMeta.label}</div><div class="ff-val">${eKWh.toFixed(2)} kWh</div></div>
             <div class="ff-item"><div class="ff-label">Cost</div><div class="ff-val">${cost.toFixed(3)} €</div></div>
             <div class="ff-item"><div class="ff-label">Efficiency</div><div class="ff-val">${efficiency} kWh/k</div></div>
         </div>
     </div>
 
-    <div class="bottom-card">
+    <div class="bottom-card" data-card="tokens">
         <div class="bc-header">
             <span class="bc-title">Token totals</span>
             <span class="bc-badge">splash</span>
@@ -766,25 +1711,31 @@ function renderBottom(splash, macmon, ollama) {
         <table class="token-table">
             <tr><th>MODEL</th><th>CACHED</th><th>PREFILL</th><th>GEN</th></tr>
             <tr><td>Qwen3.8-27B-4bit</td><td>${fmtToks(cachedTokens)}</td><td>${fmtToks(prefillTokens)}</td><td>${fmtToks(genTokens)}</td></tr>
+            ${(llmstudio && llmstudio.models) ? llmstudio.models.filter(m => m.gen > 0 || m.tps > 0).map(mo =>
+                `<tr style="color:var(--orange)"><td>LLM Studio · ${mo.id}</td><td>n/a</td><td>n/a</td><td>${fmtToks(mo.gen || 0)} (${mo.tps} t/s)</td></tr>`
+            ).join('') : ''}
             ${(ollama && ollama.count > 0) ? ollama.models.map(mo =>
                 `<tr style="color:var(--blue)"><td>${mo.name}</td><td>n/a</td><td>n/a</td><td>n/a</td></tr>`
             ).join('') : ''}
             <tr class="total"><td>TOTAL (splash)</td><td>${fmtToks(cachedTokens)}</td><td>${fmtToks(prefillTokens)}</td><td>${fmtToks(genTokens)}</td></tr>
         </table>
         ${(ollama && ollama.count > 0) ? `<div class="bc-sub" style="margin-top:8px">Ollama: ${ollama.count} model${ollama.count>1?'s':''} loaded · ${(ollama.ram_used/1e9).toFixed(1)} GB · tokens n/a (no API counter)</div>` : ''}
+        ${goUsageHTML(go)}
     </div>
 
-    <div class="bottom-card">
+    <div class="bottom-card" data-card="activity">
         <div class="bc-header">
             <span class="bc-title">Recent activity</span>
-            <span class="live-badge">LIVE</span>
+            <span class="live-badge" id="act-badge">LIVE</span>
+            <button class="act-toggle on" id="act-toggle" onclick="toggleActivityPanel()" title="Show / hide the activity feed">ON</button>
         </div>
         <ul class="activity-list" id="activity-list">${activityHTML}</ul>
-        <button class="bc-btn" style="margin-top:8px;margin-left:0" onclick="openActivityDetails()">View all activity</button>
+        <button class="bc-btn" id="act-viewall" style="margin-top:8px;margin-left:0" onclick="openActivityDetails()">View all activity</button>
     </div>`;
 
     // Draw energy chart (synchronously)
     drawEnergyChart();
+    applyActivityVisibility();
     setTimeout(() => renderActivity(), 0);
 }
 
@@ -794,27 +1745,53 @@ function drawEnergyChart() {
     const ctx = canvas.getContext('2d');
     const w = canvas.width = canvas.parentElement.offsetWidth * 2 || 400;
     const h = canvas.height = 160;
-    const pts = history['sys_power'];
-    if (!pts || pts.length < 2) { ctx.clearRect(0,0,w,h); return; }
-    const recent = pts.slice(-60);
-    const mn = 0, mx = Math.max(...recent.map(p=>p[1]), 10);
-    const pad = {t:5,r:5,b:5,l:5};
+    ctx.clearRect(0, 0, w, h);
+    // Prefer the persisted range history; fall back to the live session series
+    // (1h / default view, or when /api/energy/history has nothing yet).
+    let pts;
+    if (energyPoints.length >= 2) {
+        pts = energyPoints.map(p => [p.t, p.watts, p.gpu]);
+    } else {
+        pts = (history['sys_power'] || []).slice(-60).map(p => [p[0], p[1], 0]);
+    }
+    if (!pts || pts.length < 2) return;
+    const mx = Math.max(...pts.map(p => p[1]), 10);
+    const pad = {t: 6, r: 6, b: 18, l: 6};
     const cw = w - pad.l - pad.r, ch = h - pad.t - pad.b;
-    ctx.clearRect(0,0,w,h);
-    // Bars
-    const barW = Math.max(1, cw / recent.length - 1);
-    recent.forEach((pt, i) => {
-        const x = pad.l + i * (cw / recent.length);
-        const bh = (pt[1] / mx) * ch;
-        ctx.fillStyle = pt[1] > mx*0.8 ? 'rgba(234,67,53,0.7)' : 'rgba(249,171,0,0.6)';
+    const step = cw / pts.length;
+    const barW = Math.max(1, step - 1);
+    // Watts bars
+    pts.forEach((pt, i) => {
+        const x = pad.l + i * step;
+        const bh = Math.max(1, (pt[1] / mx) * ch);
+        ctx.fillStyle = pt[1] > mx * 0.8 ? 'rgba(234,67,53,0.7)' : 'rgba(249,171,0,0.6)';
         ctx.fillRect(x, pad.t + ch - bh, barW, bh);
     });
-    // Time labels
-    ctx.fillStyle = '#5f6368'; ctx.font = '18px system-ui';
+    // GPU watts overlay (line)
+    if (pts.some(p => p[2] > 0)) {
+        ctx.beginPath();
+        ctx.strokeStyle = 'rgba(161,68,251,0.9)';
+        ctx.lineWidth = 2;
+        pts.forEach((pt, i) => {
+            const x = pad.l + i * step + step / 2;
+            const y = pad.t + ch - Math.min(1, pt[2] / mx) * ch;
+            i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+        });
+        ctx.stroke();
+    }
+    // Time labels: dates for multi-day ranges, HH:MM for short ones
+    const spanMs = pts[pts.length - 1][0] - pts[0][0];
+    const fmt = ms => {
+        const d = new Date(ms);
+        return spanMs > 2 * 86400000
+            ? (d.getMonth() + 1) + '/' + d.getDate()
+            : String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+    };
+    ctx.fillStyle = '#5f6368'; ctx.font = '16px system-ui';
     ctx.textAlign = 'left';
-    ctx.fillText(recent[0][0] ? new Date(recent[0][0]).toLocaleTimeString().slice(0,5) : '', pad.l, h - 2);
+    ctx.fillText(fmt(pts[0][0]), pad.l, h - 4);
     ctx.textAlign = 'right';
-    ctx.fillText('now', w - pad.r, h - 2);
+    ctx.fillText(fmt(pts[pts.length - 1][0]), w - pad.r, h - 4);
 }
 
 function renderActivity() {
@@ -822,7 +1799,7 @@ function renderActivity() {
     if (!list) return;
     const items = activityLog.slice(-8).reverse();
     if (items.length === 0) {
-        list.innerHTML = '<li><span class="act-time">—</span><span class="act-dot blue"></span><span class="act-text">Monitoring started</span></li>';
+        list.innerHTML = '<li><span class="act-time">—</span><span class="act-dot blue"></span><span class="act-text">Waiting for events…</span></li>';
         return;
     }
     list.innerHTML = items.map(item => {
@@ -832,22 +1809,50 @@ function renderActivity() {
     }).join('');
 }
 
+/* ─── Activity panel on/off toggle (persisted in localStorage) ───────────── */
+const ACT_TOGGLE_KEY = 'dashsplash.activityOn';
+function activityEnabled() {
+    try { return localStorage.getItem(ACT_TOGGLE_KEY) !== '0'; } catch (e) { return true; }
+}
+function applyActivityVisibility() {
+    const on = activityEnabled();
+    const list = document.getElementById('activity-list');
+    const btn  = document.getElementById('act-viewall');
+    const badge = document.getElementById('act-badge');
+    const tog  = document.getElementById('act-toggle');
+    if (list) list.style.display = on ? '' : 'none';
+    if (btn)  btn.style.display  = on ? '' : 'none';
+    if (badge) {
+        badge.classList.toggle('paused', !on);
+        badge.textContent = on ? 'LIVE' : 'PAUSED';
+    }
+    if (tog) {
+        tog.classList.toggle('on', on);
+        tog.textContent = on ? 'ON' : 'OFF';
+        tog.setAttribute('aria-pressed', on ? 'true' : 'false');
+    }
+}
+function toggleActivityPanel() {
+    try { localStorage.setItem(ACT_TOGGLE_KEY, activityEnabled() ? '0' : '1'); } catch (e) {}
+    applyActivityVisibility();
+}
+
 function renderCharts() {
     const row = document.getElementById('charts-row');
     row.innerHTML = `
-        <div class="chart-card">
+        <div class="chart-card" data-card="chart-temp">
             <div class="chart-title"><span>GPU temperature</span>
                 <span class="chart-legend"><span class="lg" style="color:#ea4335">GPU</span><span class="lg" style="color:#f9ab00">CPU</span> <span id="ct-gpu">—</span></span>
             </div>
             <canvas id="chart-temp" class="chart-canvas"></canvas>
         </div>
-        <div class="chart-card">
+        <div class="chart-card" data-card="chart-power">
             <div class="chart-title"><span>Power</span>
                 <span class="chart-legend"><span class="lg" style="color:#a144fb">GPU</span><span class="lg" style="color:#4285f4">System</span> <span id="ct-power">—</span></span>
             </div>
             <canvas id="chart-power" class="chart-canvas"></canvas>
         </div>
-        <div class="chart-card">
+        <div class="chart-card" data-card="chart-throughput">
             <div class="chart-title"><span>Throughput</span>
                 <span class="chart-legend"><span class="lg" style="color:#34a853">Decode</span><span class="lg" style="color:#a144fb">Prefill</span> <span id="ct-tp">—</span></span>
             </div>
@@ -924,7 +1929,7 @@ function logActivity(text, color) {
     if (activityLog.length > 50) activityLog.shift();
 }
 
-function updateActivity(splash, macmon) {
+function updateActivity(splash, macmon, status) {
     const prevThermal = lastSplash.thermal_state;
     const curThermal = splash.thermal_state || 'nominal';
     if (prevThermal && curThermal !== prevThermal) {
@@ -939,18 +1944,62 @@ function updateActivity(splash, macmon) {
     if (lastMacmon.gpu_temp < 80 && (macmon.gpu_temp || 0) >= 80) {
         logActivity(`GPU hot: ${macmon.gpu_temp.toFixed(0)}°C`, 'red');
     }
+    const d = splash.splash_delta;
+    if (d) {
+        if (d.completed > 0) {
+            const inFmt = n => n >= 1000 ? (n / 1000).toFixed(1) + 'k' : String(n);
+            let txt = `Splash: ${d.completed} req · in ${inFmt(d.input + d.cached)} · cached ${inFmt(d.cached)} · out ${inFmt(d.output)}`;
+            const tps = splash.decode_tps || 0;
+            if (tps > 0) txt += ` · ${tps.toFixed(1)} tok/s`;
+            const ttft = splash.ttft_p50 || 0;
+            if (ttft > 0) txt += ` · TTFT ${ttft < 1000 ? ttft.toFixed(0) + 'ms' : (ttft / 1000).toFixed(1) + 's'}`;
+            const fail = (splash.requests_failed || 0) - (lastSplash.requests_failed || 0);
+            if (fail > 0) { txt += ` · ${fail} failed`; }
+            logActivity(txt, fail > 0 ? 'orange' : 'green');
+        }
+    }
+
+    // ── Thinking indicator (edge-triggered, from /api/splash_status) ──────
+    // Only log when a request ENTERS the active set (idle -> active, or a new
+    // id shows up) or when the set drains back to idle. Never per-poll.
+    if (status && status.ok) {
+        lastSplashStatus = status;
+        const reqs = Array.isArray(status.active_requests) ? status.active_requests : [];
+        const curIds = new Set(reqs.map(r => String(r.id)));
+        const newReqs = reqs.filter(r => !prevActiveIds.has(String(r.id)));
+        const thinking = status.reasoning_switch ? 'Thinking on' : 'Request active';
+        if (reqs.length > 0 && (prevActiveCount === 0 || newReqs.length > 0)) {
+            const show = newReqs.length ? newReqs : reqs.slice(0, 1);
+            const r = show[0];
+            const tok = (r.phase === 'prefill')
+                ? (r.prompt_processed || r.prompt_tokens || 0)
+                : (r.generated_tokens || 0);
+            const unit = r.phase === 'prefill' ? 'tok ctx' : 'tok';
+            let txt = `${thinking} - ${r.phase} - ${tok} ${unit}`;
+            if (reqs.length > 1) txt += ` (+${reqs.length - 1} more)`;
+            logActivity(txt, 'blue');
+        } else if (reqs.length === 0 && prevActiveCount > 0) {
+            logActivity('idle', 'blue');
+        }
+        prevActiveIds = curIds;
+        prevActiveCount = reqs.length;
+    }
 }
 
-function updateStatus(splash, macmon, ollama) {
+function updateStatus(splash, macmon, ollama, llmstudio) {
     const splashOk = splash.decode_tps !== undefined || splash.mem_current !== undefined;
     const macmonOk = macmon.gpu_temp !== undefined;
     const ollamaOk = !!(ollama && ollama.models !== undefined);
+    const llmstudioOk = !!(llmstudio && llmstudio.online);
     const el = document.getElementById('header-status');
     const now = new Date().toLocaleTimeString();
     const thermal = splash.thermal_state || 'nominal';
-    const ollamaState = ollama && ollama.count > 0 ? `${ollama.count} loaded` : 'idle';
-    el.innerHTML = `Splash: <span style="color:${splashOk?'var(--green)':'var(--red)'}">${splashOk?'OK':'FAIL'}</span>
-        &nbsp; Ollama: <span style="color:${ollamaOk?'var(--green)':'var(--red)'}">${ollamaOk?ollamaState:'FAIL'}</span>
+    const ollamaState = (ollama && ollama.count > 0) ? 'OK' : 'idle';
+    const llmstudioState = (llmstudio && Array.isArray(llmstudio.models) && llmstudio.models.length > 0) ? 'OK' : 'idle';
+    const sc = s => s === 'OK' ? 'var(--green)' : s === 'idle' ? 'var(--orange)' : 'var(--red)';
+    el.innerHTML = `Splash: <span style="color:${sc(splashOk?'OK':'FAIL')}">${splashOk?'OK':'FAIL'}</span>
+        &nbsp; Ollama: <span style="color:${sc(ollamaOk?ollamaState:'FAIL')}">${ollamaOk?ollamaState:'FAIL'}</span>
+        &nbsp; LLM Studio: <span style="color:${sc(llmstudioOk?llmstudioState:'FAIL')}">${llmstudioOk?llmstudioState:'FAIL'}</span>
         &nbsp; Macmon: <span style="color:${macmonOk?'var(--green)':'var(--red)'}">${macmonOk?'OK':'FAIL'}</span>
         &nbsp; Thermal: <span style="color:${thermal==='critical'?'var(--red)':thermal==='serious'?'var(--orange)':thermal==='fair'?'var(--orange)':'var(--green)'}">${thermal}</span>
         &nbsp; Runtime: ${splash.runtime || 'native'}
@@ -968,7 +2017,7 @@ function releaseModel(engine, btn) {
         body: JSON.stringify({engine: engine}),
     }).then(r => r.json()).then(res => {
         btn.textContent = res.ok ? '✓ released' : '✗ ' + (res.status || res.error || 'failed');
-        if (engine === 'ollama' && res.models && res.models.length) {
+        if (res.models && res.models.length) {
             btn.textContent = res.models.every(m => m.ok) ? '✓ all released' : '✗ ' + res.models.filter(m=>!m.ok).map(m=>m.model).join(', ');
         }
     }).catch(() => { btn.textContent = '✗ error'; })
@@ -977,16 +2026,354 @@ function releaseModel(engine, btn) {
     });
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// ─── Admin and theme ────────────────────────────────────────────────────────
+// Theme: html[data-theme] = 'dark' (default) | 'light', persisted in localStorage.
+// Panel: #admin-panel is a shell. Other modules register their own UI with
+//        window.adminSections[slot] = function () { ...inject into [data-slot=slot]... }
+//        slots: bg | layout | cards | energy | refresh
+// ═══════════════════════════════════════════════════════════════════════════
+const THEME_KEY = 'dashsplash.theme';
+const ADMIN_SLOTS = ['bg', 'layout', 'cards', 'energy', 'refresh'];
+window.adminSections = window.adminSections || {};
+
+function currentTheme() {
+    return document.documentElement.getAttribute('data-theme') === 'light' ? 'light' : 'dark';
+}
+
+function applyTheme(theme) {
+    const t = (theme === 'light') ? 'light' : 'dark';
+    document.documentElement.setAttribute('data-theme', t);
+    try { localStorage.setItem(THEME_KEY, t); } catch (e) { /* private mode */ }
+    const icon = document.getElementById('theme-btn-icon');
+    if (icon) icon.textContent = (t === 'light') ? '☾' : '☀';
+    // Charts are canvas: tell any redrawer to refresh so it can re-read tokens.
+    try { if (typeof window.onThemeChange === 'function') window.onThemeChange(t); } catch (e) {}
+    return t;
+}
+
+function saveThemeSetting(theme) {
+    try {
+        fetch('/api/settings', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({theme: theme}),
+        }).catch(() => {});
+    } catch (e) {}
+}
+
+function toggleTheme() {
+    const next = currentTheme() === 'light' ? 'dark' : 'light';
+    applyTheme(next);
+    saveThemeSetting(next);
+}
+
+// ── Custom background image (admin slot "bg") ──────────────────────────────
+// Persisted filename lives in SETTINGS.bgFile (server-side). The photo is
+// applied to <body> via the --bg-image custom property; <body> survives every
+// dashboard re-render, so the background is NOT touched by fetchData().
+var bgCurrentFile = null;
+
+function bgApply(filename) {
+    bgCurrentFile = filename || null;
+    var b = document.body;
+    if (!b) return;
+    if (bgCurrentFile) {
+        b.classList.add('has-bg');
+        b.style.setProperty('--bg-image', "url('/bg/" + encodeURIComponent(bgCurrentFile) + "')");
+    } else {
+        b.classList.remove('has-bg');
+        b.style.removeProperty('--bg-image');
+    }
+}
+
+function bgPersist(filename) {
+    fetch('/api/settings', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({bgFile: filename || null}),
+    }).catch(function () {});
+}
+
+function bgSet(filename) {          // apply now + persist
+    bgApply(filename);
+    bgPersist(filename);
+    bgRefreshSlot();
+}
+
+function bgRefreshSlot() {
+    var wrap = document.querySelector('#admin-sec-bg .admin-slot #bg-preview-wrap');
+    if (!wrap) return;
+    wrap.innerHTML = '';
+    var thumb = document.createElement('div');
+    thumb.className = 'bg-thumb';
+    if (bgCurrentFile) {
+        var img = document.createElement('img');
+        img.src = '/bg/' + encodeURIComponent(bgCurrentFile) + '?t=' + Date.now();
+        img.alt = 'Fondo actual';
+        img.style.cssText = 'display:block;width:100%;height:96px;object-fit:cover;border-radius:8px;border:1px solid var(--border);margin:6px 0 8px;';
+        wrap.appendChild(img);
+    } else {
+        thumb.classList.add('bg-empty');
+        thumb.textContent = 'Sin imagen de fondo';
+        wrap.appendChild(thumb);
+    }
+}
+
+window.adminSections['bg'] = function () {
+    var slot = document.querySelector('#admin-sec-bg .admin-slot') ||
+               document.querySelector('.admin-slot[data-slot="bg"]');
+    if (!slot) return;
+    if (slot.dataset.bgWired === '1') { bgRefreshSlot(); return; }
+    slot.dataset.bgWired = '1';
+    slot.innerHTML =
+        '<div class="bg-preview" id="bg-preview-wrap"></div>' +
+        '<div class="bg-row">' +
+          '<label class="bg-file-label">Subir foto' +
+            '<input type="file" id="bg-file-input" accept="image/*">' +
+          '</label>' +
+          '<button type="button" id="bg-clear-btn">Quitar</button>' +
+        '</div>' +
+        '<div class="bg-status" id="bg-status"></div>';
+
+    bgRefreshSlot();
+
+    var input = slot.querySelector('#bg-file-input');
+    var status = slot.querySelector('#bg-status');
+
+    input.addEventListener('change', function () {
+        var f = input.files && input.files[0];
+        if (!f) return;
+        if (f.type.indexOf('image/') !== 0) { status.textContent = '✗ no es una imagen'; return; }
+        status.textContent = 'Subiendo…';
+        var reader = new FileReader();
+        reader.onload = function () {
+            fetch('/api/bg', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({image: reader.result, name: f.name}),
+            }).then(function (r) { return r.json(); })
+              .then(function (d) {
+                  if (d && d.ok && d.filename) {
+                      bgSet(d.filename);
+                      status.textContent = '✓ ' + d.filename;
+                  } else {
+                      status.textContent = '✗ ' + ((d && d.error) || 'error');
+                  }
+              })
+              .catch(function () { status.textContent = '✗ error de red'; })
+              .finally(function () { input.value = ''; });
+        };
+        reader.onerror = function () { status.textContent = '✗ no se pudo leer el fichero'; };
+        reader.readAsDataURL(f);
+    });
+
+    slot.querySelector('#bg-clear-btn').addEventListener('click', function () {
+        status.textContent = 'Quitando…';
+        fetch('/api/bg', {method: 'POST', headers: {'Content-Type': 'application/json'},
+                          body: JSON.stringify({clear: true})})
+          .then(function (r) { return r.json(); })
+          .then(function (d) {
+              bgSet(null);
+              status.textContent = (d && d.ok) ? '✓ fondo eliminado' : '✗ error';
+          })
+          .catch(function () { bgSet(null); status.textContent = '✓ fondo quitado (local)'; });
+    });
+};
+
+// Apply the persisted background as soon as the DOM is ready.
+function bgInitFromServer() {
+    fetch('/api/bg').then(function (r) { return r.json(); })
+      .then(function (d) { bgApply(d && d.filename ? d.filename : null); })
+      .catch(function () { /* keep default theme background */ });
+}
+if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', bgInitFromServer);
+} else {
+    bgInitFromServer();
+}
+
+// ── Admin panel ────────────────────────────────────────────────────────────
+function adminRender(slot) {
+    try {
+        const fn = window.adminSections[slot];
+        if (typeof fn === 'function') fn();
+    } catch (e) {
+        console.warn('[admin] section "' + slot + '" failed:', e);
+    }
+}
+
+function adminRenderAll() { ADMIN_SLOTS.forEach(adminRender); }
+
+function adminIsOpen() {
+    const p = document.getElementById('admin-panel');
+    return !!p && !p.classList.contains('admin-hidden');
+}
+
+function adminOpen() {
+    const p = document.getElementById('admin-panel');
+    if (!p) return;
+    p.classList.remove('admin-hidden');
+    const btn = document.getElementById('admin-btn');
+    if (btn) { btn.classList.add('active'); btn.setAttribute('aria-expanded', 'true'); }
+    adminRenderAll();
+}
+
+function closeAdmin() {
+    const p = document.getElementById('admin-panel');
+    if (!p) return;
+    p.classList.add('admin-hidden');
+    const btn = document.getElementById('admin-btn');
+    if (btn) { btn.classList.remove('active'); btn.setAttribute('aria-expanded', 'false'); }
+}
+
+function adminToggle() { adminIsOpen() ? closeAdmin() : adminOpen(); }
+
+(function initAdminAndTheme() {
+    const themeBtn = document.getElementById('theme-btn');
+    if (themeBtn) themeBtn.addEventListener('click', function (e) { e.stopPropagation(); toggleTheme(); });
+
+    const adminBtn = document.getElementById('admin-btn');
+    if (adminBtn) adminBtn.addEventListener('click', function (e) { e.stopPropagation(); adminToggle(); });
+
+    const closeBtn = document.getElementById('admin-close');
+    if (closeBtn) closeBtn.addEventListener('click', function (e) { e.stopPropagation(); closeAdmin(); });
+
+    // Close on outside click (clicks inside the panel stay inside).
+    document.addEventListener('click', function (e) {
+        if (!adminIsOpen()) return;
+        const p = document.getElementById('admin-panel');
+        if (p && p.contains(e.target)) return;
+        if (adminBtn && adminBtn.contains(e.target)) return;
+        closeAdmin();
+    });
+
+    // Close on Escape.
+    document.addEventListener('keydown', function (e) {
+        if (e.key === 'Escape' && adminIsOpen()) closeAdmin();
+    });
+
+    // Sync the theme icon with whatever the bootstrap applied.
+    applyTheme(currentTheme() === 'light' ? 'light' : 'dark');
+})();
+
+// ── Refresh section: presets + custom seconds + live current-interval hint ──
+// Reads/writes currentRefreshMs (see top of script). Persists refreshMs through
+// POST /api/settings so the choice survives a dashboard reload.
+(function initRefreshSection() {
+    const PRESETS = [
+        {ms: 1000, label: '1 s'},
+        {ms: 3000, label: '3 s'},
+        {ms: 5000, label: '5 s'},
+        {ms: 10000, label: '10 s'},
+        {ms: 30000, label: '30 s'},
+        {ms: 60000, label: '1 min'},
+    ];
+
+    function injectCss() {
+        if (document.getElementById('refresh-css')) return;
+        const st = document.createElement('style');
+        st.id = 'refresh-css';
+        st.textContent = [
+            '#admin-sec-refresh .rf-grid { display:flex; flex-wrap:wrap; gap:6px; }',
+            '#admin-sec-refresh .rf-btn { font-weight:600; min-width:52px; padding:5px 8px; }',
+            '#admin-sec-refresh .rf-btn.active { background:var(--green-bg); color:var(--green);',
+            '  border-color:var(--green); font-weight:700; }',
+            '#admin-sec-refresh .rf-custom { display:flex; align-items:center; gap:6px; margin-top:10px; }',
+            '#admin-sec-refresh .rf-custom input { width:70px; }',
+            '#admin-sec-refresh .rf-custom label { padding:0; }',
+            '#admin-sec-refresh .rf-hint { margin-top:9px; font-size:11px; color:var(--text-mut); }',
+            '#admin-sec-refresh .rf-hint b { color:var(--text); }',
+        ].join('');
+        document.head.appendChild(st);
+    }
+
+    function paint(root) {
+        root.querySelectorAll('.rf-btn').forEach(b => {
+            b.classList.toggle('active', Number(b.dataset.ms) === currentRefreshMs);
+            b.setAttribute('aria-pressed', Number(b.dataset.ms) === currentRefreshMs ? 'true' : 'false');
+        });
+        const inp = root.querySelector('#rf-custom-input');
+        if (inp && document.activeElement !== inp) inp.value = String(currentRefreshMs / 1000);
+        refreshUpdateHint();
+    }
+
+    function choose(root, ms) {
+        if (!applyRefreshMs(ms, true)) { paint(root); return; }
+        saveRefreshSetting(currentRefreshMs);
+        paint(root);
+    }
+
+    window.adminSections['refresh'] = function () {
+        injectCss();
+        const root = document.querySelector('#admin-sec-refresh .admin-slot') ||
+                     document.getElementById('admin-slot-refresh');
+        if (!root) return;
+
+        if (!root.dataset.built) {
+            root.dataset.built = '1';
+            root.innerHTML =
+                '<div class="rf-grid" role="group" aria-label="Intervalo de refresco"></div>' +
+                '<div class="rf-custom">' +
+                    '<label for="rf-custom-input">Personalizado</label>' +
+                    '<input id="rf-custom-input" type="number" min="1" max="600" step="1" ' +
+                        'inputmode="numeric" aria-label="Intervalo personalizado en segundos">' +
+                    '<span>s</span>' +
+                    '<button type="button" class="rf-apply">Aplicar</button>' +
+                '</div>' +
+                '<div class="rf-hint" id="refresh-hint" aria-live="polite"></div>';
+
+            const grid = root.querySelector('.rf-grid');
+            PRESETS.forEach(p => {
+                const b = document.createElement('button');
+                b.type = 'button';
+                b.className = 'rf-btn';
+                b.dataset.ms = String(p.ms);
+                b.textContent = p.label;
+                b.addEventListener('click', function (e) { e.stopPropagation(); choose(root, p.ms); });
+                grid.appendChild(b);
+            });
+
+            const inp = root.querySelector('#rf-custom-input');
+            const applyCustom = function () {
+                const secs = Number(inp.value);
+                if (!isFinite(secs) || secs <= 0) { paint(root); return; }
+                const ms = Math.max(500, Math.min(600000, Math.round(secs * 1000)));
+                inp.value = String(ms / 1000);
+                choose(root, ms);
+            };
+            root.querySelector('.rf-apply').addEventListener('click', function (e) {
+                e.stopPropagation(); applyCustom();
+            });
+            inp.addEventListener('keydown', function (e) {
+                if (e.key === 'Enter') { e.preventDefault(); applyCustom(); }
+            });
+            inp.addEventListener('change', applyCustom);
+        }
+        paint(root);
+    };
+
+    // Seed the effective interval from the persisted setting (default = REFRESH_MS).
+    loadRefreshSetting();
+})();
+
 function fetchData() {
+    if (refreshInFlight) return;      // single-flight: one poll chain only
+    refreshInFlight = true;
     Promise.all([
         fetch('/api/splash').then(r => r.json()).catch(() => ({})),
         fetch('/api/macmon').then(r => r.json()).catch(() => ({})),
         fetch('/api/ollama').then(r => r.json()).catch(() => ({})),
-    ]).then(([splash, macmon, ollama]) => {
+        fetch('/api/llmstudio').then(r => r.json()).catch(() => ({})),
+        fetch('/api/opencodego').then(r => r.json()).catch(() => ({})),
+        fetch('/api/splash_status').then(r => r.json()).catch(() => ({})),
+    ]).then(([splash, macmon, ollama, llmstudio, opencodego, splash_status]) => {
         const now = Date.now();
         lastSplash = splash;
         lastMacmon = macmon;
         lastOllama = ollama;
+        lastLlmstudio = llmstudio;
+        lastGo = opencodego;
 
         if (splash.decode_tps !== undefined) {
             pushHistory('memory_used', splash.mem_current / 1e9, now);
@@ -1006,22 +2393,288 @@ function fetchData() {
             pushHistory('fan_rpm', macmon.fan_rpm, now);
         }
 
-        updateActivity(splash, macmon);
-        renderNode(splash, macmon, ollama);
+        updateActivity(splash, macmon, splash_status);
+        renderNode(splash, macmon, ollama, llmstudio);
         renderStats(splash, macmon);
-        renderBottom(splash, macmon, ollama);
+        renderBottom(splash, macmon, ollama, llmstudio, opencodego);
         renderCharts();
-        updateStatus(splash, macmon, ollama);
+        applyCardLayout();
+        updateStatus(splash, macmon, ollama, llmstudio);
 
-        setTimeout(fetchData, REFRESH_MS);
+        refreshInFlight = false;
+        schedulePoll();
     }).catch(() => {
-        setTimeout(fetchData, REFRESH_MS);
+        refreshInFlight = false;
+        schedulePoll();
     });
 }
 
 // Initial load
-logActivity('Monitoring started', 'green');
-logActivity('Mac Mini M5 Pro online', 'green');
+fetchData();
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ─── Energy range boot + admin section (energy slot) ────────────────────────
+// The selected range is persisted in /api/settings.energyRange; the 1h view
+// falls back to the live session series so it behaves as before.
+// ═══════════════════════════════════════════════════════════════════════════
+(function initEnergyRange() {
+    fetch('/api/settings').then(r => r.json()).then(s => {
+        if (s && ENERGY_RANGE_META.some(r => r.key === s.energyRange)) energyRange = s.energyRange;
+    }).catch(() => {}).then(() => energyFetch());
+    setInterval(energyFetch, 60000);        // keep the range chart fresh
+})();
+
+window.adminSections['energy'] = function () {
+    const el = document.querySelector('#admin-sec-energy .admin-slot')
+        || document.getElementById('admin-slot-energy');
+    if (!el) return;
+    const selId = 'energy-default-range';
+    el.innerHTML = `
+        <label>Rango por defecto
+            <select id="${selId}">
+                ${ENERGY_RANGE_META.map(r => `<option value="${r.key}"${r.key === energyRange ? ' selected' : ''}>${r.unit}</option>`).join('')}
+            </select>
+        </label>
+        <div style="margin-top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+            <button id="energy-clear-btn" type="button">Borrar historial</button>
+            <span id="energy-clear-msg" style="font-size:11px;color:var(--text-mut)"></span>
+        </div>
+        <div id="energy-hist-info" style="margin-top:6px;font-size:11px;color:var(--text-mut)">cargando…</div>`;
+
+    const sel = document.getElementById(selId);
+    if (sel) sel.addEventListener('change', () => setEnergyRange(sel.value));
+
+    const clr = document.getElementById('energy-clear-btn');
+    if (clr) clr.addEventListener('click', () => {
+        if (!confirm('¿Borrar todo el historial de consumo guardado?')) return;
+        const msg = document.getElementById('energy-clear-msg');
+        clr.disabled = true;
+        fetch('/api/energy/clear', {method: 'POST'})
+            .then(r => r.json())
+            .then(res => {
+                if (msg) msg.textContent = (res && res.ok) ? `borrado (${res.removed} muestras)` : 'error';
+                energyPoints = []; energyAgg = null;
+                energyFetch();
+                const info = document.getElementById('energy-hist-info');
+                if (info) info.textContent = 'sin historial guardado todavía';
+            })
+            .catch(() => { if (msg) msg.textContent = 'error'; })
+            .then(() => { clr.disabled = false; });
+    });
+
+    fetch('/api/energy/summary?range=90d').then(r => r.json()).then(d => {
+        const info = document.getElementById('energy-hist-info');
+        if (!info || !d) return;
+        const n = d.samples || 0;
+        if (!n) { info.textContent = 'sin historial guardado todavía'; return; }
+        const from = d.start ? new Date(d.start * 1000).toLocaleDateString() : '—';
+        info.textContent = `${n} muestras · desde ${from} · ${(d.kwh || 0).toFixed(2)} kWh / 90d · ${(d.cost || 0).toFixed(2)} €`;
+    }).catch(() => {});
+};
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ─── Card layout & visibility ───────────────────────────────────────────────
+// Single source of truth: window.dashPrefs = {visible:{id:bool}, order:[id...],
+// mode:'auto'|'onecol'|'twocol'}.  applyCardLayout() is idempotent and runs at
+// the END of every render pass (plus after every admin change), so visibility,
+// order and column mode survive the periodic innerHTML re-render of the rows.
+// ───────────────────────────────────────────────────────────────────────────
+const CARD_NATURAL_ORDER = ['node','stat-decode','stat-power','stat-memory','stat-tokens',
+    'energy','tokens','activity','chart-temp','chart-power','chart-throughput'];
+const CARD_LABELS = {
+    'node': 'Nodo / GPU',
+    'stat-decode': 'Stats · MAC decode',
+    'stat-power': 'Stats · MAC power',
+    'stat-memory': 'Stats · memoria',
+    'stat-tokens': 'Stats · tokens hoy',
+    'energy': 'Energía',
+    'tokens': 'Tokens totales',
+    'activity': 'Actividad reciente',
+    'chart-temp': 'Gráfico · temperatura',
+    'chart-power': 'Gráfico · potencia',
+    'chart-throughput': 'Gráfico · throughput'
+};
+const CARD_ROWS = ['stats-row', 'bottom-row', 'charts-row'];
+
+window.dashPrefs = window.dashPrefs || { visible: {}, order: [], mode: 'auto' };
+if (!window.dashPrefs.visible || typeof window.dashPrefs.visible !== 'object') window.dashPrefs.visible = {};
+if (!Array.isArray(window.dashPrefs.order)) window.dashPrefs.order = [];
+if (['auto', 'onecol', 'twocol'].indexOf(window.dashPrefs.mode) < 0) window.dashPrefs.mode = 'auto';
+
+function cardIdsInDom() {
+    const out = [];
+    document.querySelectorAll('[data-card]').forEach(function (el) {
+        const id = el.getAttribute('data-card');
+        if (id && out.indexOf(id) < 0) out.push(id);
+    });
+    return out;
+}
+
+// persisted order (may be partial / stale) + every card currently in the DOM
+function cardOrderFull() {
+    const dom = cardIdsInDom();
+    const out = [];
+    (window.dashPrefs.order || []).forEach(function (id) {
+        if (dom.indexOf(id) >= 0 && out.indexOf(id) < 0) out.push(id);
+    });
+    dom.forEach(function (id) { if (out.indexOf(id) < 0) out.push(id); });
+    return out;
+}
+
+function applyCardLayout() {
+    const prefs = window.dashPrefs;
+    const visible = prefs.visible || {};
+    const order = prefs.order || [];
+    const mode = ['auto', 'onecol', 'twocol'].indexOf(prefs.mode) >= 0 ? prefs.mode : 'auto';
+
+    function rank(id) { const i = order.indexOf(id); return i < 0 ? 1e6 : i; }
+
+    // 1) visibility
+    document.querySelectorAll('[data-card]').forEach(function (el) {
+        const id = el.getAttribute('data-card');
+        el.style.display = (visible[id] === false) ? 'none' : '';
+    });
+
+    // 2) order inside each row + 3) column mode
+    CARD_ROWS.forEach(function (rowId) {
+        const row = document.getElementById(rowId);
+        if (!row) return;
+        row.setAttribute('data-mode', mode);
+        const kids = Array.prototype.slice.call(row.children).filter(function (el) {
+            return el.hasAttribute && el.hasAttribute('data-card');
+        });
+        kids.map(function (el, i) { return { el: el, i: i, r: rank(el.getAttribute('data-card')) }; })
+            .sort(function (a, b) { return a.r - b.r || a.i - b.i; })
+            .forEach(function (o) { row.appendChild(o.el); });
+        const anyVisible = kids.some(function (el) { return el.style.display !== 'none'; });
+        row.style.display = anyVisible ? '' : 'none';
+    });
+}
+
+function cardSavePrefs() {
+    const prefs = window.dashPrefs;
+    try {
+        fetch('/api/settings', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                cardVisible: prefs.visible || {},
+                cardOrder: prefs.order || [],
+                mode: prefs.mode || 'auto'
+            })
+        }).catch(function () {});
+    } catch (e) {}
+}
+
+function loadCardPrefs() {
+    return fetch('/api/settings').then(function (r) { return r.json(); }).then(function (s) {
+        s = s || {};
+        const prefs = window.dashPrefs;
+        if (s.cardVisible && typeof s.cardVisible === 'object' && !Array.isArray(s.cardVisible)) {
+            prefs.visible = s.cardVisible;
+        }
+        if (Array.isArray(s.cardOrder)) prefs.order = s.cardOrder;
+        const m = s.mode || s.cardMode;
+        prefs.mode = (m === 'onecol' || m === 'twocol') ? m : 'auto';
+        applyCardLayout();
+        return prefs;
+    }).catch(function () { applyCardLayout(); });
+}
+
+function adminCardHost(slot) {
+    const sec = document.getElementById('admin-sec-' + slot);
+    if (!sec) return null;
+    return sec.querySelector('.admin-slot') || sec;
+}
+
+// ── Admin section "Tarjetas": one checkbox per card ─────────────────────────
+window.adminSections['cards'] = function () {
+    const host = adminCardHost('cards');
+    if (!host) return;
+    const visible = window.dashPrefs.visible || {};
+    const ids = cardOrderFull();
+    let html = '<div class="ad-note">Tarjetas visibles</div>';
+    ids.forEach(function (id) {
+        html += '<label class="ad-check"><input type="checkbox" data-card-toggle="' + id + '"'
+            + (visible[id] === false ? '' : ' checked') + '>'
+            + '<span>' + (CARD_LABELS[id] || id) + '</span></label>';
+    });
+    host.innerHTML = html;
+    host.querySelectorAll('[data-card-toggle]').forEach(function (cb) {
+        cb.addEventListener('change', function () {
+            const id = cb.getAttribute('data-card-toggle');
+            window.dashPrefs.visible = window.dashPrefs.visible || {};
+            window.dashPrefs.visible[id] = cb.checked;
+            applyCardLayout();
+            cardSavePrefs();
+        });
+    });
+};
+
+// ── Admin section "Diseño": column mode + card order + reset ────────────────
+window.adminSections['layout'] = function () {
+    const host = adminCardHost('layout');
+    if (!host) return;
+    const prefs = window.dashPrefs;
+    const ids = cardOrderFull();
+    const modes = [['auto', 'Auto'], ['onecol', '1 columna'], ['twocol', '2 columnas']];
+    let html = '<div class="ad-note">Columnas por fila</div><div class="ad-modes">';
+    modes.forEach(function (m) {
+        html += '<label class="ad-radio"><input type="radio" name="ad-card-mode" value="' + m[0] + '"'
+            + (prefs.mode === m[0] ? ' checked' : '') + '><span>' + m[1] + '</span></label>';
+    });
+    html += '</div><div class="ad-note">Orden de las tarjetas</div><div class="ad-order">';
+    ids.forEach(function (id, i) {
+        html += '<div class="ad-order-row"><span class="ad-order-name">' + (CARD_LABELS[id] || id) + '</span>'
+            + '<span class="ad-order-btns">'
+            + '<button type="button" class="ad-mini" data-card-up="' + id + '"' + (i === 0 ? ' disabled' : '') + ' title="Subir" aria-label="Subir">↑</button>'
+            + '<button type="button" class="ad-mini" data-card-down="' + id + '"' + (i === ids.length - 1 ? ' disabled' : '') + ' title="Bajar" aria-label="Bajar">↓</button>'
+            + '</span></div>';
+    });
+    html += '</div><div class="ad-actions"><button type="button" id="ad-card-reset">Restablecer</button></div>';
+    host.innerHTML = html;
+
+    host.querySelectorAll('input[name="ad-card-mode"]').forEach(function (rb) {
+        rb.addEventListener('change', function () {
+            if (!rb.checked) return;
+            window.dashPrefs.mode = rb.value;
+            applyCardLayout();
+            cardSavePrefs();
+        });
+    });
+
+    function move(id, delta) {
+        const list = cardOrderFull();
+        const i = list.indexOf(id);
+        const j = i + delta;
+        if (i < 0 || j < 0 || j >= list.length) return;
+        list.splice(j, 0, list.splice(i, 1)[0]);
+        window.dashPrefs.order = list;
+        applyCardLayout();
+        cardSavePrefs();
+        adminRender('layout');
+    }
+    host.querySelectorAll('[data-card-up]').forEach(function (b) {
+        b.addEventListener('click', function () { move(b.getAttribute('data-card-up'), -1); });
+    });
+    host.querySelectorAll('[data-card-down]').forEach(function (b) {
+        b.addEventListener('click', function () { move(b.getAttribute('data-card-down'), 1); });
+    });
+    const resetBtn = host.querySelector('#ad-card-reset');
+    if (resetBtn) resetBtn.addEventListener('click', function () {
+        window.dashPrefs.visible = {};
+        window.dashPrefs.order = CARD_NATURAL_ORDER.slice();
+        window.dashPrefs.mode = 'auto';
+        applyCardLayout();
+        cardSavePrefs();
+        adminRender('cards');
+        adminRender('layout');
+    });
+};
+
+// Hydrate from the backend right away (independent of the admin panel).
+loadCardPrefs();
 
 // ─── Modal helpers ─────────────────────────────────────────────────────────
 function openModal(title, sub, html) {
@@ -1047,21 +2700,24 @@ function closeModal() {
 function openEnergyDetails() {
     const sp = lastMacmon.sys_power || 0;
     const gp = lastMacmon.gpu_power || 0;
-    const kwh = energyKWh();
-    const cost = kwh * KWH_PRICE;
+    const meta = energyRangeMeta(energyRange);
+    const hasAgg = !!(energyAgg && energyAgg.samples > 0);
+    const kwh = hasAgg ? energyAgg.kwh : (energyRange === '1h' ? energyKWh() : 0);
+    const cost = hasAgg ? energyAgg.cost : kwh * KWH_PRICE;
     const genTokens = lastSplash.decode_tokens || 0;
-    const eff = genTokens > 0 ? (kwh / genTokens * 1e6).toFixed(4) : '—';
+    const eff = (genTokens > 0 && kwh > 0) ? (kwh / genTokens * 1e6).toFixed(4) : '—';
     const elapsedH = (Date.now() - startTime) / 3600000;
-    const min = elapsedH > 0 ? (elapsedH * 60).toFixed(0) + ' min' : 'just started';
+    const min = elapsedH > 0.01 ? (elapsedH * 60).toFixed(0) + ' min' : 'just started';
     const rows = [
         ['Current power', `${sp.toFixed(1)} W`],
         ['GPU power', `${gp.toFixed(1)} W`],
-        ['Session energy', `${kwh.toFixed(3)} kWh`],
+        [`Energy · ${meta.unit}`, `${kwh.toFixed(3)} kWh`],
         ['Cost', `${cost.toFixed(3)} € @ ${KWH_PRICE.toFixed(2)} €/kWh`],
+        ['Stored samples', hasAgg ? `${energyAgg.samples}` : '0 (session only)'],
         ['Efficiency', `${eff} kWh per 1k tokens`],
         ['Session duration', min],
     ];
-    openModal('Energy details', 'macmon system power · trapezoid integration',
+    openModal('Energy details', 'macmon system power · trapezoid integration · stored history',
         `<table><tr><th>Metric</th><th>Value</th></tr>${rows.map(r=>`<tr><td>${r[0]}</td><td>${r[1]}</td></tr>`).join('')}</table>`);
 }
 
@@ -1074,6 +2730,9 @@ function openTokenDetails() {
     ];
     if (ol && ol.count > 0) {
         ol.models.forEach(m => rows.push([`Ollama · ${m.name}`, 'n/a', 'n/a', 'n/a']));
+    }
+    if (lastLlmstudio && lastLlmstudio.models) {
+        lastLlmstudio.models.forEach(m => rows.push([`LLM Studio · ${m.id}`, 'n/a', 'n/a', `${fmtToks(m.gen || 0)} (${m.tps} t/s)`]));
     }
     openModal('Token details', 'Splash: from Prometheus counters · Ollama: no token API',
         `<table><tr><th>Model</th><th>Cached</th><th>Prefill</th><th>Generated</th></tr>` +
@@ -1092,8 +2751,6 @@ function openActivityDetails() {
         : '<li><span class="act-text">No activity yet</span></li>';
     openModal('All activity', `${items.length} events since page load`, `<ul class="activity-list">${html}</ul>`);
 }
-
-fetchData();
 </script>
 </body>
 </html>'''
@@ -1127,6 +2784,18 @@ def api_macmon():
 def api_ollama():
     return jsonify(ollama_cache.get('ollama', {}))
 
+@app.route('/api/llmstudio')
+def api_llmstudio():
+    return jsonify(llmstudio_cache.get('llmstudio', {}))
+
+@app.route('/api/opencodego')
+def api_opencodego():
+    return jsonify(_go_cache or {})
+
+@app.route('/api/splash_status')
+def api_splash_status():
+    return jsonify(splash_status_cache.get('splash_status', {}))
+
 @app.route('/api/release', methods=['POST'])
 def api_release():
     """Release a model from RAM on demand.
@@ -1153,10 +2822,290 @@ def api_release():
                 except Exception as e:
                     unloaded.append({"model": mo['name'], "ok": False, "error": str(e)[:120]})
             return jsonify({"engine": "ollama", "ok": True, "models": unloaded})
-        return jsonify({"error": "engine must be 'splash' or 'ollama'"}), 400
+        if engine == 'llmstudio':
+            ls = llmstudio_cache.get('llmstudio', {})
+            base = LLMSTUDIO_URL.rstrip('/')
+            unloaded = []
+            for mo in ls.get('models', []):
+                try:
+                    cr = requests.post(f"{base}/api/v0/models/{mo['id']}/unload", timeout=15)
+                    unloaded.append({"model": mo['id'], "ok": cr.status_code in (200, 202)})
+                except Exception as e:
+                    unloaded.append({"model": mo['id'], "ok": False, "error": str(e)[:120]})
+            return jsonify({"engine": "llmstudio", "ok": True, "models": unloaded})
+        return jsonify({"error": "engine must be 'splash', 'ollama' or 'llmstudio'"}), 400
     except Exception as e:
         return jsonify({"engine": engine, "ok": False, "error": str(e)[:200]}), 502
 
+# ─── Settings store (theme, refresh, background, card order/visibility, …) ──
+import json
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.getenv("DASHSPLASH_DATA_DIR", os.path.join(BASE_DIR, "data"))
+SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
+
+DEFAULT_SETTINGS = {
+    "theme": "dark",
+    "refreshMs": 5000,
+    "bgFile": None,
+    "cardOrder": [],
+    "cardVisible": {},
+    "energyRange": "1h",
+}
+
+SETTINGS = dict(DEFAULT_SETTINGS)
+
+
+def load_settings():
+    """Load settings.json into the module-level SETTINGS dict (defaults first)."""
+    global SETTINGS
+    merged = {k: (v.copy() if isinstance(v, (dict, list)) else v) for k, v in DEFAULT_SETTINGS.items()}
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        if os.path.exists(SETTINGS_FILE):
+            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            if isinstance(raw, dict):
+                for k, v in raw.items():
+                    merged[k] = v          # keep known keys AND extra keys added elsewhere
+    except Exception as e:
+        print(f"[SETTINGS] load failed ({SETTINGS_FILE}): {e}", flush=True)
+    SETTINGS = merged
+    return SETTINGS
+
+
+def save_settings(patch=None):
+    """Merge `patch` into SETTINGS and overwrite settings.json atomically."""
+    global SETTINGS
+    if isinstance(patch, dict):
+        SETTINGS.update(patch)
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        tmp = SETTINGS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(SETTINGS, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, SETTINGS_FILE)     # overwrite
+        return True
+    except Exception as e:
+        print(f"[SETTINGS] save failed ({SETTINGS_FILE}): {e}", flush=True)
+        return False
+
+
+SETTINGS = load_settings()
+print(f"[START] settings loaded from {SETTINGS_FILE}: theme={SETTINGS.get('theme')} "
+      f"refreshMs={SETTINGS.get('refreshMs')}", flush=True)
+
+
+@app.route('/api/settings', methods=['GET'])
+def api_settings_get():
+    return jsonify(SETTINGS)
+
+
+@app.route('/api/settings', methods=['POST'])
+def api_settings_post():
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"error": "body must be a JSON object"}), 400
+    save_settings(body)
+    return jsonify(SETTINGS)
+
+
+# ─── Custom background image: upload / query / serve ─────────────────────────
+BG_DIR = os.path.join(DATA_DIR, "bg")
+ALLOWED_BG_EXT = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".avif"}
+MAX_BG_BYTES = 25 * 1024 * 1024
+
+
+def _bg_safe_name(name):
+    """Return a safe basename or None (no path traversal)."""
+    if not name:
+        return None
+    name = str(name)
+    base = os.path.basename(name)
+    if base != name or base in (".", "..") or base.startswith("."):
+        return None
+    if os.path.splitext(base)[1].lower() not in ALLOWED_BG_EXT:
+        return None
+    return base
+
+
+def _bg_current_filename():
+    """Filename stored in SETTINGS.bgFile that actually exists on disk."""
+    name = _bg_safe_name(SETTINGS.get("bgFile"))
+    if not name:
+        return None
+    return name if os.path.isfile(os.path.join(BG_DIR, name)) else None
+
+
+@app.route('/api/bg', methods=['GET'])
+def api_bg_get():
+    return jsonify({"ok": True, "filename": _bg_current_filename()})
+
+
+@app.route('/api/bg', methods=['POST'])
+def api_bg_post():
+    """Accept a multipart file field 'image' OR JSON {image: 'data:image/...;base64,...'}.
+    JSON {clear: true} removes the background. Persists SETTINGS.bgFile."""
+    import base64
+    from flask import send_from_directory  # noqa: F401  (kept local: used by /bg route)
+
+    os.makedirs(BG_DIR, exist_ok=True)
+    raw = None
+    ext = None
+
+    up = request.files.get('image')
+    if up is not None and up.filename:
+        raw = up.read()
+        ext = os.path.splitext(up.filename)[1].lower()
+        if ext not in ALLOWED_BG_EXT:
+            mt = (up.mimetype or '').lower()
+            ext = {'.png': '.png', '.jpeg': '.jpg', '.webp': '.webp',
+                   '.gif': '.gif', '.bmp': '.bmp', '.avif': '.avif'}.get(
+                       '.' + mt.split('/')[-1], None)
+    else:
+        body = request.get_json(silent=True)
+        if isinstance(body, dict) and body.get('clear'):
+            save_settings({"bgFile": None})
+            return jsonify({"ok": True, "filename": None})
+        data = None
+        if isinstance(body, dict):
+            data = body.get('image') or body.get('dataUrl') or body.get('data')
+            name = body.get('name') or 'bg'
+            ext = os.path.splitext(str(name))[1].lower() or None
+        if isinstance(data, str):
+            if data.startswith('data:'):
+                header, _, payload = data.partition(',')
+                mime = header[5:].split(';')[0].strip().lower()
+                if not ext:
+                    ext = '.' + mime.split('/')[-1] if mime.startswith('image/') else None
+                try:
+                    raw = base64.b64decode(payload, validate=False)
+                except Exception:
+                    raw = None
+            else:                                  # bare base64
+                try:
+                    raw = base64.b64decode(data, validate=False)
+                except Exception:
+                    raw = None
+
+    if not raw:
+        return jsonify({"ok": False, "error": "no image received (field 'image' or JSON data URL)"}), 400
+    if len(raw) > MAX_BG_BYTES:
+        return jsonify({"ok": False, "error": "image too large (max 25 MB)"}), 413
+
+    # Normalise extension by magic bytes when the client gave us nothing usable.
+    if ext not in ALLOWED_BG_EXT:
+        if raw[:3] == b'\xff\xd8\xff':
+            ext = '.jpg'
+        elif raw[:8] == b'\x89PNG\r\n\x1a\n':
+            ext = '.png'
+        elif raw[:4] == b'RIFF' and raw[8:12] == b'WEBP':
+            ext = '.webp'
+        elif raw[:6] in (b'GIF87a', b'GIF89a'):
+            ext = '.gif'
+        else:
+            ext = '.jpg'
+    if ext == '.jpeg':
+        ext = '.jpg'
+
+    filename = 'bg' + ext
+    # Drop previous background files so data/bg never accumulates.
+    try:
+        for old in os.listdir(BG_DIR):
+            if old.lower().startswith('bg.'):
+                try:
+                    os.remove(os.path.join(BG_DIR, old))
+                except OSError:
+                    pass
+    except OSError:
+        pass
+
+    path = os.path.join(BG_DIR, filename)
+    try:
+        with open(path, 'wb') as f:
+            f.write(raw)
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"write failed: {e}"}), 500
+
+    save_settings({"bgFile": filename})
+    print(f"[BG] stored {filename} ({len(raw)} bytes) -> SETTINGS.bgFile", flush=True)
+    return jsonify({"ok": True, "filename": filename, "size": len(raw)})
+
+
+@app.route('/bg/<path:filename>', methods=['GET'])
+def serve_bg(filename):
+    from flask import send_from_directory
+    name = _bg_safe_name(filename)
+    if not name:
+        return jsonify({"error": "not found"}), 404
+    if not os.path.isfile(os.path.join(BG_DIR, name)):
+        return jsonify({"error": "not found"}), 404
+    resp = send_from_directory(BG_DIR, name, max_age=0)
+    resp.headers['Cache-Control'] = 'no-cache, must-revalidate'
+    return resp
+
+
+# ─── Energy history API (power samples persisted under data/energy/) ────────
+@app.route('/api/energy/history')
+def api_energy_history():
+    """Downsampled power points for a range (default: settings energyRange).
+
+    ?range=1h|24h|7d|30d|90d  →  {"range","start","end","samples","kwh","cost",
+                                    "points":[{t,watts,gpu_watts}, ...]}
+    """
+    rng = str(request.args.get('range') or SETTINGS.get('energyRange') or '1h').strip()
+    if rng not in ENERGY_RANGES:
+        return jsonify({"error": "range must be one of " + ", ".join(ENERGY_RANGES)}), 400
+    return jsonify(_energy_query(rng))
+
+
+@app.route('/api/energy/summary')
+def api_energy_summary():
+    """Aggregate kWh + cost for a range (no points payload)."""
+    rng = str(request.args.get('range') or SETTINGS.get('energyRange') or '1h').strip()
+    if rng not in ENERGY_RANGES:
+        return jsonify({"error": "range must be one of " + ", ".join(ENERGY_RANGES)}), 400
+    q = _energy_query(rng) or {}
+    return jsonify({
+        "range": rng,
+        "start": q.get("start"),
+        "end": q.get("end"),
+        "samples": q.get("samples", 0),
+        "kwh": q.get("kwh", 0.0),
+        "cost": q.get("cost", 0.0),
+        "kwhPrice": KWH_PRICE,
+    })
+
+
+@app.route('/api/energy/clear', methods=['POST'])
+def api_energy_clear():
+    """Wipe the persisted power history (used by the admin 'borrar historial')."""
+    with _ENERGY_LOCK:
+        rows = _energy_load()
+        removed = len(rows)
+        rows.clear()
+        _energy_rewrite(rows)
+    print(f"[ENERGY] history cleared ({removed} samples)", flush=True)
+    return jsonify({"ok": True, "removed": removed})
+
+
 if __name__ == '__main__':
     print(f"{NODE_NAME} Monitor on 0.0.0.0:{PORT}")
+    # Load persisted settings (theme/bg/cards/refresh) before serving.
+    load_settings()
+    # Seed the LLM Studio cache synchronously so the very first request
+    # (and the first dashboard render) shows real data instead of a FAIL.
+    try:
+        _ls = fetch_llmstudio()
+        if _ls:
+            llmstudio_cache['llmstudio'] = _ls
+            print(f"[START] LLM Studio seeded: {_ls.get('count')} models, {_ls.get('tps')} tps")
+    except Exception as e:
+        print(f"[START] LLM Studio seed failed: {e}")
+    # Seed the OpenCode Go quota cache too (never raises).
+    try:
+        _go = fetch_opencodego()
+        print(f"[START] OpenCode Go seeded: online={_go.get('online')} reason={_go.get('reason')}")
+    except Exception as e:
+        print(f"[START] OpenCode Go seed failed: {e}")
     app.run(host='0.0.0.0', port=PORT, threaded=True)

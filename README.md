@@ -23,8 +23,66 @@ Dashboard de monitoreo en tiempo real para **Splash** (motor de inferencia LLM e
 | **Stats agregados** | Splash + macmon | Decode tok/s (sparkline), power W (sparkline), memoria en uso % (RAM real de macmon: splash + ollama + OS), tokens totales |
 | **Energy** | macmon | kWh sesión, current W, eficiencia kWh/token, gráfica de barras 24h |
 | **Token totals** | Splash | Generated / Cached / Prefill, tabla por modelo |
-| **Activity** | Splash + macmon + Ollama | Log en vivo (decode started/finished, thermal, GPU hot, modelos Ollama cargados/descargados) |
+| **Activity** | Splash + macmon + Ollama | Log en vivo (decode started/finished, thermal, GPU hot, modelos Ollama cargados/descargados) + indicador **Thinking** desde `/api/splash_status`, con interruptor **LIVE / PAUSED** |
+| **Cuota OpenCode Go** | API de uso de OpenCode Go | % consumido de las ventanas rolling/semanal/mensual + tiempo hasta el reinicio (throttle 120 s) |
+| **Panel admin** | `data/settings.json` | Fondo propio, columnas y orden de tarjetas, tarjetas visibles, rango de energía, intervalo de refresco y tema claro/oscuro |
 | **Gráficas** | Splash + macmon | GPU temp, power, throughput (líneas 5 min) |
+
+## Funciones nuevas (sin versión publicada)
+
+Estas cuatro funciones ya están en `main`, pero todavía no llevan release etiquetada.
+
+### 1. Panel de cuota OpenCode Go
+
+El bloque *OpenCode Go (delegation quota)*, al pie de la tarjeta de tokens, muestra el consumo de las tres ventanas de cuota de la delegación:
+
+| Ventana | Qué mide |
+|---|---|
+| `rolling` | Ventana móvil corta |
+| `weekly` | Cuota semanal |
+| `monthly` | Cuota mensual |
+
+Por cada ventana se muestra el **% consumido** (verde < 70 %, naranja ≥ 70 %, rojo ≥ 90 %) y el tiempo hasta el reinicio (`resets in 3h`, `resets in 5d`, `resetting now`).
+
+- **Endpoint**: `GET /api/opencodego` → `{online, windows: {rolling, weekly, monthly}, fetched_at, reason}`; cada ventana trae `status`, `percent` y `resetsAt`.
+- **Throttle de 120 s**: el backend cachea la respuesta 120 segundos, de modo que el bucle de 5 s no martillea la API externa.
+- **Sin clave no hay petición**: el panel queda inerte, solo con una línea atenuada (`unavailable · no_api_key`); nunca se pinta un bloque de error.
+- Si la API devuelve un HTTP de error o un payload inválido, el bloque muestra `unavailable` con el motivo y el resto del dashboard sigue igual.
+
+Configuración en `.env` (la plantilla ya trae los dos campos):
+
+```bash
+DASHSPLASH_OPENCODE_GO_URL="https://opencode.ai/zen/go/v1/usage"
+DASHSPLASH_OPENCODE_GO_KEY="your_key_here"   # tu clave real; el repo solo lleva el placeholder
+```
+
+> La clave se lee del entorno: `.env` está gitignored y en el repositorio solo aparece `your_key_here`.
+
+### 2. Estado en vivo de las peticiones a Splash
+
+- **Endpoint**: `GET /api/splash_status` — proxy del `/status` de Splash (`DASHSPLASH_STATUS_URL`, por defecto `<splash>/status`): `ready`, `thermal_state`, `reasoning_switch`, contadores del scheduler y lista de `active_requests` (id, phase, tokens de prompt/generados, edad).
+- **Indicador "Thinking"** en *Recent activity*: al entrar una petición nueva en el conjunto activo se registra `Thinking on - decode - N tok` (o `... - prefill - N tok ctx`; con varias, `(+N more)`); al vaciarse, `idle`.
+- **Edge-triggered**: solo se escribe en el log cuando una petición *entra* o cuando el conjunto se vacía — nunca en cada poll, para no inundar el feed.
+- Si `/status` falla se conserva la última instantánea buena: la UI no parpadea a vacío.
+
+### 3. Panel de administración / personalización
+
+Botón de ajustes en la cabecera (junto al del tema). Todo se persiste en el servidor (`data/settings.json`, `GET`/`POST /api/settings`) y se reaplica al recargar:
+
+| Sección | Opciones |
+|---|---|
+| **Fondo** | Subir imagen (JPG/PNG/WEBP/GIF/BMP/AVIF, máx. 25 MB) vía `POST /api/bg`, miniatura del fondo actual y botón para quitarlo |
+| **Diseño** | Columnas por fila: `Auto`, `1 columna`, `2 columnas`; reordenar tarjetas con ↑/↓; restablecer |
+| **Tarjetas** | Mostrar/ocultar cada tarjeta del dashboard |
+| **Energía** | Rango por defecto del bloque de energía: `1h`, `24h`, `1 semana`, `1 mes`, `3 meses` |
+| **Refresco** | Presets 1 s / 3 s / 5 s / 10 s / 30 s / 1 min, o intervalo personalizado (0,5–600 s) |
+| **Tema** | Claro / oscuro; botón rápido en la cabecera, persistido en `localStorage` |
+
+Los fondos se guardan en `data/bg/`; `data/` está **gitignored**, así que fotos y ajustes no se suben nunca.
+
+### 4. Actividad LIVE / PAUSED
+
+*Recent activity* lleva un interruptor en la cabecera de la tarjeta: `LIVE` mientras el feed se actualiza y `PAUSED` (botón en `OFF`) al pausarlo, lo que oculta la lista y el botón *View all activity*. El estado se guarda en `localStorage` (`dashsplash.activityOn`), se recuerda entre recargas y no afecta al resto del dashboard.
 
 ## Arquitectura
 
@@ -153,6 +211,11 @@ Todo se configura con **variables de entorno** (o un fichero `.env` que el launc
    DASHSPLASH_NODE_NAME="Mac Mini M5 Pro"
    DASHSPLASH_NODE_IP="192.168.1.x"  # solo cosmético (badge)
    DASHSPLASH_PORT="8081"
+   DASHSPLASH_KWH_PRICE="0.13"       # €/kWh para el cálculo de coste
+
+   # OpenCode Go — cuota de delegación (optativo)
+   DASHSPLASH_OPENCODE_GO_URL="https://opencode.ai/zen/go/v1/usage"
+   DASHSPLASH_OPENCODE_GO_KEY="your_key_here"   # sin clave el panel queda inerte
    ```
 
 3. **Reinicia** el servicio para que cargue los cambios:

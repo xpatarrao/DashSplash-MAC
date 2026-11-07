@@ -23,8 +23,66 @@ Real-time monitoring dashboard for **Splash** (LLM inference engine on Apple Sil
 | **Aggregated stats** | Splash + macmon | Decode tok/s (sparkline), power W (sparkline), memory in use % (real system RAM from macmon: splash + ollama + OS), total tokens |
 | **Energy** | macmon | Session kWh, current W, efficiency kWh/token, 24h bar chart |
 | **Token totals** | Splash | Generated / Cached / Prefill, per-model table |
-| **Activity** | Splash + macmon + Ollama | Live log (decode started/finished, thermal, GPU hot, Ollama models loaded/unloaded) |
+| **Activity** | Splash + macmon + Ollama | Live log (decode started/finished, thermal, GPU hot, Ollama models loaded/unloaded) + **Thinking** indicator from `/api/splash_status`, with a **LIVE / PAUSED** toggle |
+| **OpenCode Go quota** | OpenCode Go usage API | % used of the rolling/weekly/monthly windows + time to reset (120 s throttle) |
+| **Admin panel** | `data/settings.json` | Custom background, columns and card order, visible cards, energy range, refresh interval and light/dark theme |
 | **Charts** | Splash + macmon | GPU temp, power, throughput (5 min lines) |
+
+## New features (unreleased)
+
+These four features are already on `main` but have no tagged release yet.
+
+### 1. OpenCode Go quota panel
+
+The *OpenCode Go (delegation quota)* block, at the bottom of the tokens card, shows usage for the three delegation quota windows:
+
+| Window | What it measures |
+|---|---|
+| `rolling` | Short moving window |
+| `weekly` | Weekly quota |
+| `monthly` | Monthly quota |
+
+For each window it shows the **% used** (green < 70 %, orange ≥ 70 %, red ≥ 90 %) and the time until it resets (`resets in 3h`, `resets in 5d`, `resetting now`).
+
+- **Endpoint**: `GET /api/opencodego` → `{online, windows: {rolling, weekly, monthly}, fetched_at, reason}`; each window carries `status`, `percent` and `resetsAt`.
+- **120 s throttle**: the backend caches the response for 120 seconds, so the 5 s loop never hammers the external API.
+- **No key, no request**: the panel stays inert, showing only a muted line (`unavailable · no_api_key`); it never renders an error block.
+- If the API returns an HTTP error or an invalid payload, the block shows `unavailable` with the reason and the rest of the dashboard keeps working.
+
+Configuration in `.env` (the template already ships both fields):
+
+```bash
+DASHSPLASH_OPENCODE_GO_URL="https://opencode.ai/zen/go/v1/usage"
+DASHSPLASH_OPENCODE_GO_KEY="your_key_here"   # your real key; the repo only carries the placeholder
+```
+
+> The key is read from the environment: `.env` is gitignored and the repository only ever contains `your_key_here`.
+
+### 2. Live Splash request status
+
+- **Endpoint**: `GET /api/splash_status` — proxy for Splash's `/status` (`DASHSPLASH_STATUS_URL`, defaults to `<splash>/status`): `ready`, `thermal_state`, `reasoning_switch`, scheduler counters and the `active_requests` list (id, phase, prompt/generated tokens, age).
+- **"Thinking" indicator** in *Recent activity*: when a new request enters the active set it logs `Thinking on - decode - N tok` (or `... - prefill - N tok ctx`; with several, `(+N more)`); when the set drains, `idle`.
+- **Edge-triggered**: a line is written only when a request *enters* or when the set empties — never on every poll, so the feed is not flooded.
+- If `/status` fails, the last good snapshot is kept, so the UI never flickers to empty.
+
+### 3. Admin / personalization panel
+
+Settings button in the header (next to the theme one). Everything is persisted server-side (`data/settings.json`, `GET`/`POST /api/settings`) and re-applied on reload:
+
+| Section | Options |
+|---|---|
+| **Background** | Upload an image (JPG/PNG/WEBP/GIF/BMP/AVIF, max 25 MB) via `POST /api/bg`, thumbnail of the current background and a button to remove it |
+| **Layout** | Columns per row: `Auto`, `1 column`, `2 columns`; reorder cards with ↑/↓; reset |
+| **Cards** | Show/hide each dashboard card |
+| **Energy** | Default range for the energy block: `1h`, `24h`, `1 week`, `1 month`, `3 months` |
+| **Refresh** | Presets 1 s / 3 s / 5 s / 10 s / 30 s / 1 min, or a custom interval (0.5–600 s) |
+| **Theme** | Light / dark; quick toggle in the header, persisted in `localStorage` |
+
+Background files live in `data/bg/`; `data/` is **gitignored**, so photos and settings are never pushed.
+
+### 4. Activity LIVE / PAUSED
+
+*Recent activity* has a toggle in the card header: `LIVE` while the feed updates and `PAUSED` (button in `OFF`) when paused, which hides the list and the *View all activity* button. The state is stored in `localStorage` (`dashsplash.activityOn`), survives reloads and does not affect the rest of the dashboard.
 
 ## Architecture
 
@@ -153,6 +211,11 @@ Everything is configured with **environment variables** (or a `.env` file that t
    DASHSPLASH_NODE_NAME="Mac Mini M5 Pro"
    DASHSPLASH_NODE_IP="192.168.1.x"  # cosmetic badge only
    DASHSPLASH_PORT="8081"
+   DASHSPLASH_KWH_PRICE="0.13"       # € per kWh for the cost estimate
+
+   # OpenCode Go — delegation quota (optional)
+   DASHSPLASH_OPENCODE_GO_URL="https://opencode.ai/zen/go/v1/usage"
+   DASHSPLASH_OPENCODE_GO_KEY="your_key_here"   # without a key the panel stays inert
    ```
 
 3. **Restart** the service to pick up the changes:
