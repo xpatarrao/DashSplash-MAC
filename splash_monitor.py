@@ -2935,6 +2935,7 @@ main { padding: 26px 30px 90px; max-width: 1680px; margin: 0 auto; }
 #grid {
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+    align-items: start;   /* expanded card grows without stretching its neighbours */
     gap: 18px;
 }
 
@@ -3053,6 +3054,59 @@ main { padding: 26px 30px 90px; max-width: 1680px; margin: 0 auto; }
 .spark rect.hi { opacity: .95; filter: drop-shadow(0 0 3px var(--ac)); }
 .spark-empty { font-family: var(--mono); font-size: 9px; color: var(--mut); letter-spacing: .1em; }
 
+/* ---------- expandable detail (in-place accordion) ---------- */
+.mcard { cursor: pointer; }
+.mcard:focus-visible { outline: 2px solid color-mix(in srgb, var(--ac) 60%, transparent); outline-offset: 3px; }
+.mcard.expanded { border-color: color-mix(in srgb, var(--ac) 40%, var(--border)); }
+
+.mexp {
+    display: flex; flex-direction: column; gap: 10px;
+    margin-top: 12px; padding-top: 11px;
+    border-top: 1px dashed rgba(255,255,255,0.07);
+    animation: expIn .22s ease both;
+}
+.mexp[hidden] { display: none; }
+@keyframes expIn { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
+
+.mexp-l {
+    font-family: var(--mono); font-size: 9.5px; letter-spacing: 0.18em;
+    color: var(--mut); text-transform: uppercase;
+}
+.mexp-goal {
+    font-size: 12px; line-height: 1.5; color: #cfd7e4;
+    white-space: pre-wrap; word-break: break-word;
+}
+.mexp-tail {
+    display: flex; flex-direction: column; gap: 4px;
+    font-family: var(--mono); font-size: 10.5px; line-height: 1.5;
+    max-height: 250px; overflow-y: auto;
+    padding: 9px 11px 11px; border-radius: 9px;
+    border: 1px solid rgba(255,255,255,0.06);
+    background: rgba(0,0,0,0.28);
+    overscroll-behavior: contain;
+    scrollbar-width: thin;
+    scrollbar-color: #2a3444 transparent;
+}
+.mexp-tail::-webkit-scrollbar { width: 6px; }
+.mexp-tail::-webkit-scrollbar-thumb { background: #2a3444; border-radius: 3px; }
+.mline { display: flex; align-items: baseline; gap: 8px; }
+.mline .ts { flex: 0 0 auto; color: #3f4a5a; }
+.mline .rl {
+    flex: 0 0 66px; font-size: 9.5px; letter-spacing: 0.06em; text-transform: uppercase;
+    color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.mline .tx { flex: 1; color: #b9c3d2; white-space: pre-wrap; word-break: break-word; }
+.mline[data-role="tool"] .rl { color: var(--ac); }
+.mline[data-role="tool"] .tx { color: #dfe6f2; }
+.mline[data-role="assistant"] .tx { color: #e8eaed; }
+.mline[data-role="think"] .tx { color: var(--dim); font-style: italic; }
+.mline[data-role="result"] .tx { color: #8f98a8; }
+.mline[data-role="error"] .rl,
+.mline[data-role="error"] .tx { color: var(--red); }
+.mline[data-role="final"] .rl { color: var(--teal); }
+.mexp-empty { font-family: var(--mono); font-size: 10px; color: var(--mut); letter-spacing: .08em; }
+.mexp-more { font-family: var(--mono); font-size: 9.5px; color: var(--mut); letter-spacing: .08em; }
+
 /* ---------- empty state ---------- */
 #empty {
     display: none;
@@ -3156,6 +3210,9 @@ function makeCard(m) {
     const el = document.createElement('article');
     el.className = 'mcard enter';
     el.dataset.status = m.status;
+    el.setAttribute('role', 'button');
+    el.setAttribute('tabindex', '0');
+    el.setAttribute('aria-expanded', 'false');
     el.innerHTML =
         '<div class="mtop">' +
             '<span class="chip"><i class="d"></i><span class="chip-t"></span></span>' +
@@ -3171,6 +3228,12 @@ function makeCard(m) {
         '</div>' +
         '<div class="mfoot"><span class="toolchip"></span>' +
             '<svg class="spark" viewBox="0 0 64 16" preserveAspectRatio="none"></svg>' +
+        '</div>' +
+        '<div class="mexp" hidden>' +
+            '<div><div class="mexp-l">full goal</div><div class="mexp-goal"></div></div>' +
+            '<div><div class="mexp-l">live tail</div>' +
+                '<div class="mexp-tail"></div>' +
+                '<div class="mexp-more"></div></div>' +
         '</div>';
     const ref = {
         el: el,
@@ -3183,13 +3246,108 @@ function makeCard(m) {
         fill: el.querySelector('.pbar-fill'),
         stp: el.querySelector('.stp'),
         tool: el.querySelector('.toolchip'),
-        spark: el.querySelector('.spark')
+        spark: el.querySelector('.spark'),
+        exp: el.querySelector('.mexp'),
+        expGoal: el.querySelector('.mexp-goal'),
+        expTail: el.querySelector('.mexp-tail'),
+        expMore: el.querySelector('.mexp-more'),
+        open: false,
+        loaded: false,
+        key: '',
+        loading: false
     };
     refs.set(m.id, ref);
+    wireExpand(ref, m.id);
     gridEl.appendChild(el);
     setTimeout(() => el.classList.remove('enter'), 520);
     return ref;
 }
+
+function wireExpand(ref, id) {
+    const toggle = () => setExpanded(ref, !ref.open);
+    ref.el.addEventListener('click', (ev) => {
+        // let people scroll/select inside the expanded log without collapsing it
+        if (ev.target.closest('.mexp-tail')) return;
+        if (window.getSelection && String(window.getSelection())) return;
+        toggle();
+    });
+    ref.el.addEventListener('keydown', (ev) => {
+        if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); toggle(); }
+        if (ev.key === 'Escape' && ref.open) { ev.preventDefault(); setExpanded(ref, false); }
+    });
+    ref.id = id;
+}
+
+function setExpanded(ref, on) {
+    ref.open = on;
+    ref.el.classList.toggle('expanded', on);
+    ref.el.setAttribute('aria-expanded', on ? 'true' : 'false');
+    ref.exp.hidden = !on;
+    if (on) loadDetail(ref);
+}
+
+function mlineHTML(l) {
+    return '<div class="mline" data-role="' + (l.role || '') + '">' +
+        '<span class="ts">' + (l.t || '') + '</span>' +
+        '<span class="rl">' + (l.role || '') + '</span>' +
+        '<span class="tx"></span></div>';
+}
+
+function unescapeTail(s) {
+    // the live transcript stores newlines/tabs escaped; unpack them for reading.
+    // Built from char codes on purpose: this file is a Python literal, and
+    // backslash escapes here are a trap (they get eaten before reaching the JS).
+    var BS = String.fromCharCode(92), NL = String.fromCharCode(10);
+    return String(s || '')
+        .split(BS + 'r' + BS + 'n').join(NL)
+        .split(BS + 'n').join(NL)
+        .split(BS + 't').join('  ')
+        .split(NL + NL + NL).join(NL + NL);
+}
+
+function paintDetail(ref, d) {
+    ref.expGoal.textContent = d.goal || '(no goal)';
+    const tail = d.tail || [];
+    if (!tail.length) {
+        ref.expTail.innerHTML = '<span class="mexp-empty">no lines yet — warming up</span>';
+        ref.expMore.textContent = '';
+        return;
+    }
+    const near = ref.expTail.scrollHeight - ref.expTail.scrollTop - ref.expTail.clientHeight < 24;
+    ref.expTail.innerHTML = tail.map(mlineHTML).join('');
+    const nodes = ref.expTail.querySelectorAll('.mline .tx');
+    tail.forEach((l, i) => { if (nodes[i]) nodes[i].textContent = unescapeTail(l.text); });
+    ref.expMore.textContent = (d.lines_total > tail.length
+        ? 'last ' + tail.length + ' of ' + d.lines_total + ' lines'
+        : d.lines_total + ' lines') + ' · live';
+    if (near) ref.expTail.scrollTop = ref.expTail.scrollHeight;
+}
+
+async function loadDetail(ref) {
+    if (ref.loading || !ref.id) return;
+    const hash = ref.id.lastIndexOf('#');
+    const deleg = ref.id.slice(0, hash);
+    const task = ref.id.slice(hash + 1);
+    ref.loading = true;
+    try {
+        const r = await fetch('/api/minions/' + encodeURIComponent(deleg) + '/' + encodeURIComponent(task),
+                              { cache: 'no-store' });
+        if (!r.ok) throw new Error('http ' + r.status);
+        const d = await r.json();
+        const key = (d.goal || '').length + ':' + (d.lines_total || 0) + ':' +
+                    ((d.tail && d.tail.length) ? (d.tail[d.tail.length - 1].t + d.tail[d.tail.length - 1].text).length : 0);
+        if (key !== ref.key) { ref.key = key; paintDetail(ref, d); }
+        ref.loaded = true;
+    } catch (e) {
+        if (!ref.loaded) {
+            ref.expTail.innerHTML = '<span class="mexp-empty">detail unavailable</span>';
+            ref.expMore.textContent = '';
+        }
+    } finally {
+        ref.loading = false;
+    }
+}
+
 
 function updateCard(ref, m) {
     ref.el.dataset.status = m.status;
@@ -3211,6 +3369,8 @@ function updateCard(ref, m) {
     }
     ref.tool.textContent = m.last_action || 'think';
     ref.spark.innerHTML = sparkHTML(m.spark || new Array(12).fill(0));
+    // an expanded card keeps its tail live on every 3s poll
+    if (ref.open) loadDetail(ref);
 }
 
 function render(list) {
@@ -3605,6 +3765,15 @@ def _minion_goal_steps(goal):
 
 MINION_GOAL_CHARS = 120
 
+# --- expand-on-click detail (in-place accordion) ----------------------------
+# The list card keeps its short goal (see _minion_short_goal); the detail
+# endpoint behind a click returns the full goal plus the live log tail. Still
+# scrubbed, still capped — the panel is unauthenticated on the LAN.
+MINION_TAIL_LINES = int(os.getenv("DASHSPLASH_MINION_TAIL_LINES", "24"))
+MINION_LINE_CHARS = int(os.getenv("DASHSPLASH_MINION_LINE_CHARS", "400"))
+MINION_DETAIL_GOAL_CHARS = int(os.getenv("DASHSPLASH_MINION_DETAIL_GOAL_CHARS", "4000"))
+_MINION_DELEG_RE = re.compile(r"^deleg_[A-Za-z0-9]{4,40}$")
+
 
 def _minion_short_goal(goal, limit=MINION_GOAL_CHARS):
     """The /minions panel is served unauthenticated on the LAN: never echo a
@@ -3712,6 +3881,73 @@ def _minion_build(deleg_id, task_idx, data, manifest):
     return item
 
 
+def _minion_manifest(ddir):
+    """manifest.json of one delegation dir ({} when missing/broken)."""
+    try:
+        with open(os.path.join(ddir, "manifest.json"), "r", encoding="utf-8") as fh:
+            return json.load(fh) or {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _minion_task_meta(manifest, idx):
+    """manifest + the per-task entry, keeping scan_minions' merge semantics."""
+    tasks_meta = {t.get("index"): t for t in (manifest.get("tasks") or []) if isinstance(t, dict)}
+    meta = dict(manifest)
+    meta.update({k: v for k, v in (tasks_meta.get(idx) or {}).items() if v})
+    return meta
+
+
+def _minion_detail(deleg_id, task_idx):
+    """Full goal + live log tail for one card. Returns None when not found.
+
+    The goal is the thing the card truncates at 120 chars; here it comes whole
+    (scrubbed, capped by DASHSPLASH_MINION_DETAIL_GOAL_CHARS). The tail is the
+    last MINION_TAIL_LINES parsed blocks, verbatim, each line capped so a giant
+    tool result cannot blow up the JSON.
+    """
+    if not _MINION_DELEG_RE.match(deleg_id or ""):
+        return None
+    try:
+        idx = int(task_idx)
+    except (TypeError, ValueError):
+        return None
+    if not 0 <= idx <= 99:
+        return None
+
+    ddir = os.path.join(DELEG_LIVE_DIR, deleg_id)
+    path = os.path.join(ddir, "task-%d.log" % idx)
+    data = _minion_log(path)
+    if not data:
+        return None
+
+    item = _minion_build(deleg_id, idx, data, _minion_task_meta(_minion_manifest(ddir), idx))
+
+    goal = " ".join(str(data.get("goal") or "").split())
+    goal_cut = len(goal) > MINION_DETAIL_GOAL_CHARS
+    if goal_cut:
+        goal = goal[:MINION_DETAIL_GOAL_CHARS].rstrip() + "…"
+    item["goal"] = goal                      # replaces the 120-char list version
+    item["goal_truncated"] = goal_cut
+
+    blocks = data.get("blocks") or []
+    tail = []
+    for b in blocks[-MINION_TAIL_LINES:]:
+        txt = b.get("text") or ""
+        if len(txt) > MINION_LINE_CHARS:
+            txt = txt[:MINION_LINE_CHARS].rstrip() + "…"
+        ts = b.get("ts")
+        tail.append({
+            "t": time.strftime("%H:%M:%S", time.localtime(ts)) if ts else "",
+            "role": b.get("role") or "",
+            "text": txt,
+        })
+    item["tail"] = _minion_scrub_obj(tail)
+    item["lines_total"] = len(blocks)
+    item["tail_lines"] = len(tail)
+    return item
+
+
 def scan_minions():
     """Every live delegation task, newest activity first."""
     out = []
@@ -3724,13 +3960,7 @@ def scan_minions():
         ddir = os.path.join(DELEG_LIVE_DIR, deleg_id)
         if not os.path.isdir(ddir):
             continue
-        manifest = {}
-        try:
-            with open(os.path.join(ddir, "manifest.json"), "r", encoding="utf-8") as fh:
-                manifest = json.load(fh) or {}
-        except (OSError, ValueError):
-            manifest = {}
-        tasks_meta = {t.get("index"): t for t in (manifest.get("tasks") or []) if isinstance(t, dict)}
+        manifest = _minion_manifest(ddir)
         try:
             names = os.listdir(ddir)
         except OSError:
@@ -3749,9 +3979,7 @@ def scan_minions():
             data = _minion_log(path)
             if not data:
                 continue
-            meta = dict(manifest)
-            meta.update({k: v for k, v in (tasks_meta.get(idx) or {}).items() if v})
-            item = _minion_build(deleg_id, idx, data, meta)
+            item = _minion_build(deleg_id, idx, data, _minion_task_meta(manifest, idx))
             item["mtime"] = int(data["mtime"])
             out.append(item)
     _minion_cache_prune(now)
@@ -3767,6 +3995,19 @@ def api_minions():
     except Exception as e:  # never 500 the panel
         print(f"[MINIONS] scan failed: {e}", flush=True)
         return jsonify([])
+
+
+@app.route("/api/minions/<deleg_id>/<int:task_idx>")
+def api_minion_detail(deleg_id, task_idx):
+    """One card expanded: full goal + the live log tail (last N lines)."""
+    try:
+        item = _minion_detail(deleg_id, task_idx)
+        if item is None:
+            return jsonify({"error": "not found"}), 404
+        return jsonify(_minion_scrub_obj(item))
+    except Exception as e:  # never 500 the panel
+        print(f"[MINIONS] detail failed: {e}", flush=True)
+        return jsonify({"error": "unavailable"}), 503
 
 
 @app.route("/minions")
